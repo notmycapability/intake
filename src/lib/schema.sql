@@ -53,7 +53,8 @@ CREATE TABLE IF NOT EXISTS submissions (
   answers JSONB NOT NULL DEFAULT '{}',
   snapshot JSONB NOT NULL DEFAULT '{}',
   ready JSONB NOT NULL DEFAULT '[]',
-  clarify JSONB NOT NULL DEFAULT '[]'
+  clarify JSONB NOT NULL DEFAULT '[]',
+  notes JSONB NOT NULL DEFAULT '[]'
 );
 
 CREATE INDEX IF NOT EXISTS submissions_questionnaire_idx ON submissions (questionnaire_id, created_at DESC);

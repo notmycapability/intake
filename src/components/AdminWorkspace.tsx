@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { AppsrowLogo } from '@/components/AppsrowLogo'
+import { Icon, initials, statusClass } from '@/components/admin/icons'
 import {
   type QuestionnaireData,
   type SectionData,
@@ -20,13 +21,22 @@ import {
   isChoiceType,
   qCount,
   logicCount,
-  slugify,
-  isValidSlug,
 } from '@/lib/questions'
 import { exportResponses } from '@/lib/exportResponses'
 import { isPlaceholderValue } from '@/lib/contactFields'
 
-type Page = 'questionnaires' | 'editor' | 'responses' | 'response-detail' | 'settings'
+type Page = 'overview' | 'questionnaires' | 'builder' | 'responses' | 'templates' | 'settings' | 'developer'
+type CreateMode = 'blank' | 'template' | 'duplicate' | 'import'
+
+const PAGE_TITLES: Record<Page, string> = {
+  overview: 'Overview',
+  questionnaires: 'Questionnaires',
+  builder: 'Builder',
+  responses: 'Responses',
+  templates: 'Templates',
+  settings: 'Settings',
+  developer: 'Developer',
+}
 
 export function AdminWorkspace({
   initialQuestionnaires,
@@ -41,54 +51,52 @@ export function AdminWorkspace({
   const [questionnaires, setQuestionnaires] = useState(initialQuestionnaires)
   const [responses, setResponses] = useState(initialResponses)
   const [workspace, setWorkspace] = useState(initialWorkspace)
-  const [page, setPage] = useState<Page>('questionnaires')
+  const [page, setPage] = useState<Page>('overview')
+  const [sidebarOpen, setSidebarOpen] = useState(false)
   const [currentQId, setCurrentQId] = useState(questionnaires[0]?.id || '')
   const [currentQuestionId, setCurrentQuestionId] = useState<string | null>(null)
   const [currentResponseId, setCurrentResponseId] = useState<string | null>(null)
-  const [questionFilter, setQuestionFilter] = useState('all')
   const [questionSearch, setQuestionSearch] = useState('')
+  const [collapsedSections, setCollapsedSections] = useState<Record<string, boolean>>({})
+  const [previewDevice, setPreviewDevice] = useState<'desktop' | 'mobile'>('desktop')
+  const [previewPick, setPreviewPick] = useState('')
   const [responseFilter, setResponseFilter] = useState('all')
   const [responseSearch, setResponseSearch] = useState('')
   const [responseQuestionnaire, setResponseQuestionnaire] = useState('all')
   const [responseProjectType, setResponseProjectType] = useState('all')
   const [responseDate, setResponseDate] = useState('all')
+  const [selectedResponses, setSelectedResponses] = useState<string[]>([])
   const [qSearch, setQSearch] = useState('')
   const [qStatusFilter, setQStatusFilter] = useState('all')
   const [toast, setToast] = useState('')
-  const [editorTab, setEditorTab] = useState<'questions' | 'design' | 'settings'>('questions')
   const [showCreateModal, setShowCreateModal] = useState(false)
+  const [showShareModal, setShowShareModal] = useState(false)
+  const [showCommand, setShowCommand] = useState(false)
+  const [commandQuery, setCommandQuery] = useState('')
+  const [noteDraft, setNoteDraft] = useState('')
+  const [settingsSection, setSettingsSection] = useState('general')
+  const [audit, setAudit] = useState<{ title: string; time: string }[]>([])
 
   function showToast(msg: string) {
     setToast(msg)
     setTimeout(() => setToast(''), 1800)
   }
-
   function showError(err: unknown) {
     showToast(err instanceof Error ? err.message : 'Something went wrong.')
+  }
+  function logAction(title: string) {
+    setAudit((prev) => [{ title, time: 'Just now' }, ...prev].slice(0, 12))
   }
 
   const currentQ = useMemo(() => questionnaires.find((q) => q.id === currentQId), [questionnaires, currentQId])
   const currentResponse = useMemo(() => responses.find((r) => r.id === currentResponseId), [responses, currentResponseId])
+  const defaultQ = useMemo(() => questionnaires.find((q) => q.isDefault && q.status !== 'trash') || questionnaires.find((q) => q.status === 'live'), [questionnaires])
+  const newCount = responses.filter((r) => r.status === 'new').length
 
-  function goPage(p: Page) {
-    setPage(p)
+  function goPage(next: Page) {
+    setPage(next)
+    setSidebarOpen(false)
     window.scrollTo({ top: 0, behavior: 'smooth' })
-  }
-
-  function openEditor(id: string) {
-    setCurrentQId(id)
-    const q = questionnaires.find((x) => x.id === id)
-    const firstQ = q?.sections.flatMap((s) => s.questions)[0]
-    setCurrentQuestionId(firstQ?.id || null)
-    setQuestionFilter('all')
-    setQuestionSearch('')
-    setEditorTab('questions')
-    goPage('editor')
-  }
-
-  function openResponseDetail(rid: string) {
-    setCurrentResponseId(rid)
-    goPage('response-detail')
   }
 
   function publicUrl(q: QuestionnaireData) {
@@ -107,25 +115,81 @@ export function AdminWorkspace({
     } catch (err) { showError(err) }
   }
 
-  async function toggleStatus(q: QuestionnaireData) {
+  function openBuilder(id: string) {
+    setCurrentQId(id)
+    const q = questionnaires.find((x) => x.id === id)
+    setCurrentQuestionId(q?.sections.flatMap((s) => s.questions)[0]?.id || null)
+    setQuestionSearch('')
+    setPreviewPick('')
+    goPage('builder')
+  }
+
+  function openShare(q: QuestionnaireData) {
+    setCurrentQId(q.id)
+    setShowShareModal(true)
+  }
+
+  async function patchQuestionnaire(id: string, body: Record<string, unknown>, message?: string) {
+    const res = await fetch(`/api/adl/questionnaires/${id}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    })
+    if (!res.ok) { showToast('Could not update questionnaire'); return null }
+    const data = await res.json() as { questionnaire: QuestionnaireData }
+    setQuestionnaires((prev) => prev.map((x) => {
+      if (x.id === id) return data.questionnaire
+      if (body.isDefault === true) return { ...x, isDefault: false }
+      return x
+    }))
+    if (message) showToast(message)
+    return data.questionnaire
+  }
+
+  async function setQStatus(q: QuestionnaireData, status: QuestionnaireData['status']) {
+    const labels: Record<string, string> = { live: 'Published', draft: 'Moved to draft', closed: 'Closed', archived: 'Archived', trash: 'Moved to trash' }
+    await patchQuestionnaire(q.id, { status }, labels[status] || 'Updated')
+    logAction(`${q.name} → ${status}`)
+  }
+
+  async function duplicateQuestionnaire(q: QuestionnaireData) {
     try {
-      const newStatus = q.status === 'live' ? 'draft' : 'live'
-      const res = await fetch(`/api/adl/questionnaires/${q.id}`, {
-        method: 'PUT', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status: newStatus }),
+      const res = await fetch('/api/adl/questionnaires', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: `${q.name} copy`, purpose: q.purpose, mode: 'duplicate', sourceId: q.id }),
       })
-      if (!res.ok) { showToast('Failed to update status'); return }
-      const data = await res.json() as { questionnaire: QuestionnaireData }
-      setQuestionnaires((prev) => prev.map((x) => x.id === q.id ? data.questionnaire : x))
-      showToast(newStatus === 'live' ? 'Published' : 'Moved to draft')
+      const data = await res.json() as { questionnaire?: QuestionnaireData; error?: string }
+      if (!res.ok || !data.questionnaire) { showToast(data.error || 'Could not duplicate'); return }
+      setQuestionnaires((prev) => [...prev, data.questionnaire!])
+      showToast('Questionnaire duplicated')
+      logAction(`Duplicated ${q.name}`)
+      openBuilder(data.questionnaire.id)
     } catch (err) { showError(err) }
+  }
+
+  async function makeHomepageForm(q: QuestionnaireData) {
+    await patchQuestionnaire(q.id, { isDefault: true, status: 'live' }, 'This form now opens on the public homepage')
+  }
+
+  async function handleDeleteQuestionnaire(q: QuestionnaireData, permanent: boolean) {
+    if (permanent) {
+      if (!confirm(`Permanently delete "${q.name}"? This cannot be undone.`)) return
+      try {
+        const res = await fetch(`/api/adl/questionnaires/${q.id}`, { method: 'DELETE' })
+        if (!res.ok) { const d = await res.json().catch(() => ({})) as { error?: string }; showToast(d.error || 'Failed to delete.'); return }
+        setQuestionnaires((prev) => prev.filter((x) => x.id !== q.id))
+        setResponses((prev) => prev.filter((r) => r.questionnaireId !== q.id))
+        if (page === 'builder') goPage('questionnaires')
+        showToast('Questionnaire deleted')
+        logAction(`Deleted ${q.name}`)
+      } catch (err) { showError(err) }
+      return
+    }
+    await setQStatus(q, 'trash')
   }
 
   async function saveQuestion(q: QuestionnaireData, question: QuestionData) {
     try {
       const res = await fetch(`/api/adl/questions/${question.id}`, {
-        method: 'PUT', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(question),
+        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(question),
       })
       if (!res.ok) { showToast('Failed to save question'); return }
       const data = await res.json() as { question: QuestionData }
@@ -171,8 +235,7 @@ export function AdminWorkspace({
   async function addNewSection(q: QuestionnaireData, title: string) {
     try {
       const res = await fetch(`/api/adl/questionnaires/${q.id}/sections`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title }),
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title }),
       })
       if (!res.ok) { showToast('Failed to add section'); return }
       const data = await res.json() as { section: SectionData }
@@ -181,37 +244,58 @@ export function AdminWorkspace({
     } catch (err) { showError(err) }
   }
 
-  async function handleDeleteQuestionnaire(q: QuestionnaireData) {
-    if (q.isDefault) { showToast('Cannot delete the default questionnaire.'); return }
-    if (!confirm(`Delete "${q.name}"? This will also remove all its sections, questions, and responses. This cannot be undone.`)) return
+  async function setResponseStatus(r: ResponseData, status: ResponseData['status']) {
     try {
-      const res = await fetch(`/api/adl/questionnaires/${q.id}`, { method: 'DELETE' })
-      if (!res.ok) { const d = await res.json().catch(() => ({})) as { error?: string }; showToast(d.error || 'Failed to delete.'); return }
-      setQuestionnaires((prev) => prev.filter((x) => x.id !== q.id))
-      setResponses((prev) => prev.filter((r) => r.questionnaireId !== q.id))
-      goPage('questionnaires')
-      showToast('Questionnaire deleted')
-    } catch (err) { showError(err) }
-  }
-
-  async function toggleResponseStatus(r: ResponseData) {
-    try {
-      const newStatus = r.status === 'reviewed' ? 'new' : 'reviewed'
       const res = await fetch(`/api/adl/responses/${r.id}`, {
-        method: 'PUT', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status: newStatus }),
+        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status }),
       })
       if (!res.ok) { showToast('Failed to update status'); return }
-      setResponses((prev) => prev.map((x) => x.id === r.id ? { ...x, status: newStatus } : x))
-      showToast(newStatus === 'reviewed' ? 'Marked reviewed' : 'Marked new')
+      setResponses((prev) => prev.map((x) => x.id === r.id ? { ...x, status } : x))
+      showToast(`Marked ${status}`)
     } catch (err) { showError(err) }
   }
 
-  async function handleCreateQuestionnaire(input: { name: string; slug: string; purpose: string; mode: string; isDefault?: boolean }) {
+  async function addNote(r: ResponseData, body: string) {
+    if (!body.trim()) return
+    try {
+      const res = await fetch(`/api/adl/responses/${r.id}`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ note: body.trim() }),
+      })
+      const data = await res.json() as { notes?: ResponseData['notes']; error?: string }
+      if (!res.ok) { showToast(data.error || 'Could not add note'); return }
+      setResponses((prev) => prev.map((x) => x.id === r.id ? { ...x, notes: data.notes || x.notes } : x))
+      setNoteDraft('')
+      showToast('Note added')
+    } catch (err) { showError(err) }
+  }
+
+  async function deleteResponsePermanently(r: ResponseData) {
+    if (!confirm('Permanently delete this response?')) return
+    try {
+      const res = await fetch(`/api/adl/responses/${r.id}`, { method: 'DELETE' })
+      if (!res.ok) { showToast('Could not delete'); return }
+      setResponses((prev) => prev.filter((x) => x.id !== r.id))
+      if (currentResponseId === r.id) setCurrentResponseId(null)
+      showToast('Response deleted')
+    } catch (err) { showError(err) }
+  }
+
+  async function handleCreateQuestionnaire(input: { name: string; mode: CreateMode; sourceId?: string; isDefault?: boolean }) {
+    if (input.mode === 'import') {
+      setShowCreateModal(false)
+      goPage('developer')
+      return
+    }
     try {
       const res = await fetch('/api/adl/questionnaires', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(input),
+        body: JSON.stringify({
+          name: input.name,
+          mode: input.mode === 'template' ? 'template' : input.mode,
+          sourceId: input.sourceId,
+          templateId: input.mode === 'template' ? input.sourceId : undefined,
+          isDefault: input.isDefault,
+        }),
       })
       const data = await res.json() as { questionnaire?: QuestionnaireData; error?: string }
       if (!res.ok || !data.questionnaire) { showToast(data.error || 'Failed to create'); return }
@@ -221,42 +305,37 @@ export function AdminWorkspace({
       })
       setShowCreateModal(false)
       showToast('Questionnaire created')
-      openEditor(data.questionnaire.id)
+      logAction(`Created ${data.questionnaire.name}`)
+      openBuilder(data.questionnaire.id)
     } catch (err) { showError(err) }
   }
 
-  async function makeHomepageForm(q: QuestionnaireData) {
+  async function saveWorkspace(input: WorkspaceSettings) {
     try {
-      const res = await fetch(`/api/adl/questionnaires/${q.id}`, {
-        method: 'PUT', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ isDefault: true, status: 'live' }),
+      const res = await fetch('/api/adl/workspace', {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input),
       })
-      if (!res.ok) { showToast('Failed to set homepage form'); return }
-      const data = await res.json() as { questionnaire: QuestionnaireData }
-      setQuestionnaires((prev) => prev.map((x) => (
-        x.id === q.id ? { ...data.questionnaire, isDefault: true } : { ...x, isDefault: false }
-      )))
-      showToast('This form now opens on the public homepage')
+      if (!res.ok) { showToast('Failed to save workspace'); return }
+      const data = await res.json() as { workspace: WorkspaceSettings }
+      setWorkspace(data.workspace)
+      showToast('Workspace saved')
+      logAction('Workspace settings updated')
     } catch (err) { showError(err) }
   }
 
   const filteredQuestionnaires = useMemo(() => {
     const query = qSearch.toLowerCase()
     return questionnaires
-      .filter((q) => !q.isDefault)
-      .filter((q) => !query || q.name.toLowerCase().includes(query) || q.purpose.toLowerCase().includes(query))
-      .filter((q) => qStatusFilter === 'all' || q.status === qStatusFilter)
+      .filter((q) => qStatusFilter === 'all' ? q.status !== 'trash' : q.status === qStatusFilter)
+      .filter((q) => !query || q.name.toLowerCase().includes(query) || q.purpose.toLowerCase().includes(query) || q.slug.toLowerCase().includes(query))
   }, [questionnaires, qSearch, qStatusFilter])
-
-  const defaultQ = useMemo(() => questionnaires.find((q) => q.isDefault), [questionnaires])
 
   const filteredResponses = useMemo(() => {
     const query = responseSearch.toLowerCase()
     const now = Date.now()
-    const startOfToday = new Date()
-    startOfToday.setHours(0, 0, 0, 0)
+    const startOfToday = new Date(); startOfToday.setHours(0, 0, 0, 0)
     return responses
-      .filter((r) => responseFilter === 'all' || r.status === responseFilter)
+      .filter((r) => responseFilter === 'all' ? r.status !== 'trash' : r.status === responseFilter)
       .filter((r) => responseQuestionnaire === 'all' || r.questionnaireId === responseQuestionnaire)
       .filter((r) => responseProjectType === 'all' || r.projectType === responseProjectType)
       .filter((r) => {
@@ -271,334 +350,395 @@ export function AdminWorkspace({
       .filter((r) => !query || `${r.name} ${r.company} ${r.email} ${r.projectType} ${r.questionnaireName || ''} ${r.answers.map((a) => a.join(' ')).join(' ')}`.toLowerCase().includes(query))
   }, [responses, responseFilter, responseSearch, responseQuestionnaire, responseProjectType, responseDate])
 
-  const projectTypeOptions = useMemo(() => (
-    Array.from(new Set(responses.map((r) => r.projectType).filter(Boolean))).sort()
-  ), [responses])
-
-  const responseCounts = useMemo(() => ({
-    all: responses.length,
-    new: responses.filter((r) => r.status === 'new').length,
-    reviewed: responses.filter((r) => r.status === 'reviewed').length,
-    incomplete: responses.filter((r) => r.status === 'incomplete').length,
-  }), [responses])
+  const projectTypeOptions = useMemo(() => Array.from(new Set(responses.map((r) => r.projectType).filter(Boolean))).sort(), [responses])
 
   const currentQuestion = useMemo(() => {
     if (!currentQ || !currentQuestionId) return null
     for (const s of currentQ.sections) {
       const q = s.questions.find((x) => x.id === currentQuestionId)
-      if (q) return { ...q, sectionId: s.id }
+      if (q) return q
     }
     return null
   }, [currentQ, currentQuestionId])
 
-  return (
-    <div className="min-h-screen bg-canvas text-ink">
-      {/* Header */}
-      <div className="sticky top-0 z-[60] border-b border-line bg-canvas/[.96]">
-        <header className="mx-auto grid h-auto min-h-[80px] max-w-[1360px] grid-cols-[1fr_auto] items-center gap-4 px-4 py-2 md:grid-cols-[190px_1fr_auto] md:px-6">
-          <button onClick={() => goPage('questionnaires')} className="flex items-center">
-            <AppsrowLogo className="h-auto w-[130px] md:w-[154px]" />
-          </button>
-          <nav className="order-3 col-span-full flex items-center gap-6 overflow-auto border-t border-line pt-2 md:order-none md:col-span-1 md:justify-center md:border-0 md:pt-0 lg:gap-8">
-            {(['questionnaires', 'responses', 'settings'] as const).map((p) => (
-              <button
-                key={p}
-                onClick={() => goPage(p)}
-                className={`relative shrink-0 border-0 bg-transparent px-0 py-4 text-[15px] font-semibold md:py-6 ${page === p || (p === 'questionnaires' && page === 'editor') ? 'text-ink' : 'text-muted'}`}
-              >
-                {p[0].toUpperCase() + p.slice(1)}
-                {(page === p || (p === 'questionnaires' && page === 'editor')) && (
-                  <span className="absolute inset-x-0 bottom-0 h-[3px] bg-red" />
-                )}
-              </button>
-            ))}
-          </nav>
-          <div className="flex items-center gap-2">
-            <button className="btn btn-red btn-sm md:btn-sm" onClick={() => setShowCreateModal(true)}>Create questionnaire</button>
-            <button className="btn btn-ghost btn-sm" onClick={handleLogout}>Lock</button>
-          </div>
-        </header>
-      </div>
+  useEffect(() => {
+    if (!currentResponseId && filteredResponses[0]) setCurrentResponseId(filteredResponses[0].id)
+  }, [filteredResponses, currentResponseId])
 
-      <main className="mx-auto max-w-[1360px] px-4 pb-24 pt-8 md:px-6 md:pt-12">
-        {/* --- QUESTIONNAIRES --- */}
-        {page === 'questionnaires' && (
-          <div>
-            <div className="mb-8 flex flex-col gap-4 md:mb-12 md:flex-row md:items-end md:justify-between md:gap-8">
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault()
+        setShowCommand(true)
+      }
+      if (e.key === 'Escape') { setShowCommand(false); setShowCreateModal(false); setShowShareModal(false) }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
+
+  const liveCount = questionnaires.filter((q) => q.status === 'live').length
+  const draftCount = questionnaires.filter((q) => q.status === 'draft').length
+  const overviewActivity = [
+    ...responses.slice(0, 4).map((r) => ({ title: `New response from ${r.name}`, meta: `${r.submittedAt} · ${r.questionnaireName || 'Questionnaire'}`, color: '#C12029' })),
+    ...audit.slice(0, 3).map((a) => ({ title: a.title, meta: a.time, color: '#18864B' })),
+  ].slice(0, 6)
+
+  return (
+    <div className="v4">
+      <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`}>
+        <button className="brand" onClick={() => goPage('overview')}><AppsrowLogo className="h-auto w-[123px]" /></button>
+        <div className="workspace-label">Workspace</div>
+        <nav className="nav">
+          <NavBtn icon="overview" label="Overview" active={page === 'overview'} onClick={() => goPage('overview')} />
+          <NavBtn icon="form" label="Questionnaires" active={page === 'questionnaires' || page === 'builder'} onClick={() => goPage('questionnaires')} />
+          <NavBtn icon="inbox" label="Responses" active={page === 'responses'} onClick={() => goPage('responses')} badge={newCount || undefined} />
+          <NavBtn icon="template" label="Templates" active={page === 'templates'} onClick={() => goPage('templates')} />
+        </nav>
+        <div className="nav-divider" />
+        <nav className="nav">
+          <NavBtn icon="settings" label="Settings" active={page === 'settings'} onClick={() => goPage('settings')} />
+          <NavBtn icon="code" label="Developer" active={page === 'developer'} onClick={() => goPage('developer')} />
+        </nav>
+        <div className="sidebar-spacer" />
+        <div className="workspace-switch">
+          <div className="workspace-mark">{initials(workspace.name)}</div>
+          <div className="workspace-info">
+            <div className="workspace-name">{workspace.name}</div>
+            <div className="workspace-sub">{workspace.domain.replace(/^https?:\/\//, '')}</div>
+          </div>
+        </div>
+      </aside>
+
+      <div className="main">
+        <header className="topbar">
+          <button className="icon-btn mobile-nav-trigger" onClick={() => setSidebarOpen((v) => !v)}><Icon name="form" className="sm" /></button>
+          <div className="topbar-title">{PAGE_TITLES[page]}</div>
+          <button className="global-search" onClick={() => setShowCommand(true)}>
+            <Icon name="search" className="sm" />
+            <span>Search questionnaires, responses, settings</span>
+            <span className="kbd">⌘K</span>
+          </button>
+          <div className="spacer" style={{ flex: 1 }} />
+          <button className="btn sm" onClick={() => setShowCreateModal(true)}><Icon name="plus" className="xs" />New</button>
+          <button className="icon-btn" title="Lock" onClick={() => void handleLogout()}><Icon name="lock" className="sm" /></button>
+          <button className="avatar" title="Admin">AD</button>
+        </header>
+
+        {page === 'overview' && (
+          <section className="page">
+            <div className="page-head">
               <div>
-                <div className="kicker">Appsrow Discovery</div>
-                <h1 className="mt-2 text-[clamp(32px,4.6vw,56px)] font-semibold leading-none tracking-[-0.045em]">Questionnaires</h1>
-                <p className="mt-4 max-w-[760px] text-base leading-relaxed text-muted">Build focused discovery flows, collect structured responses, and turn client input into clearer project decisions.</p>
+                <div className="eyebrow">Today</div>
+                <h1>Discovery workspace</h1>
+                <p className="page-sub">Create questionnaires, collect client responses, and keep every flow in a clear lifecycle from draft to archive.</p>
+              </div>
+              <div className="head-actions">
+                <button className="btn" onClick={() => goPage('templates')}><Icon name="template" className="sm" />Browse templates</button>
+                <button className="btn primary" onClick={() => setShowCreateModal(true)}><Icon name="plus" className="sm" />New questionnaire</button>
               </div>
             </div>
+            <div className="metrics">
+              <Metric label="Questionnaires" value={questionnaires.filter((q) => q.status !== 'trash').length} meta={`${liveCount} live · ${draftCount} draft`} />
+              <Metric label="Live forms" value={liveCount} meta="Accepting public responses" />
+              <Metric label="New responses" value={newCount} meta={`${responses.length} total`} />
+              <Metric label="Reviewed" value={responses.filter((r) => r.status === 'reviewed').length} meta="Ready for follow-up" />
+            </div>
+            <div className="grid-2">
+              <div className="card">
+                <div className="card-head">
+                  <div><h3>Recent responses</h3><div className="card-sub">Newest submissions across all questionnaires.</div></div>
+                  <button className="btn sm" onClick={() => goPage('responses')}>Open inbox</button>
+                </div>
+                {responses.filter((r) => r.status !== 'trash').slice(0, 6).map((r) => (
+                  <button key={r.id} className="response-row-mini" onClick={() => { setCurrentResponseId(r.id); goPage('responses') }}>
+                    <div className="person-avatar">{initials(r.name)}</div>
+                    <div className="activity-body">
+                      <div className="activity-title">{r.name}</div>
+                      <div className="activity-meta">{[r.company, r.projectType, r.submittedAt].filter(Boolean).join(' · ')}</div>
+                    </div>
+                    <span className={`status ${statusClass(r.status)}`}>{r.status}</span>
+                  </button>
+                ))}
+                {!responses.length && <div className="response-empty">No responses yet.</div>}
+              </div>
+              <div className="card">
+                <div className="card-head"><div><h3>Activity</h3><div className="card-sub">Recent workspace changes.</div></div></div>
+                {overviewActivity.length ? overviewActivity.map((item, i) => (
+                  <div key={i} className="activity-row">
+                    <div className="activity-dot" style={{ background: item.color, boxShadow: `0 0 0 5px ${item.color}22` }} />
+                    <div className="activity-body">
+                      <div className="activity-title">{item.title}</div>
+                      <div className="activity-meta">{item.meta}</div>
+                    </div>
+                  </div>
+                )) : <div className="response-empty">Activity will appear as you work.</div>}
+              </div>
+            </div>
+          </section>
+        )}
 
+        {page === 'questionnaires' && (
+          <section className="page">
+            <div className="page-head">
+              <div>
+                <div className="eyebrow">Workspace</div>
+                <h1>Questionnaires</h1>
+                <p className="page-sub">Create, publish and manage focused discovery flows with a safe lifecycle from draft to archive.</p>
+              </div>
+              <div className="head-actions">
+                <button className="btn" onClick={() => goPage('templates')}><Icon name="template" className="sm" />Browse templates</button>
+                <button className="btn primary" onClick={() => setShowCreateModal(true)}><Icon name="plus" className="sm" />New questionnaire</button>
+              </div>
+            </div>
+            <div className="page-insights">
+              <span className="insight-chip"><strong>{questionnaires.filter((q) => q.status !== 'trash').length}</strong> questionnaires</span>
+              <span className="insight-chip"><span className="insight-dot green" /> <strong>{liveCount}</strong> live</span>
+              <span className="insight-chip"><strong>{responses.length}</strong> total responses</span>
+              <span className="insight-chip"><strong>{draftCount}</strong> drafts</span>
+            </div>
             {defaultQ && (
-              <div className="relative mb-8 border border-ink bg-white p-4 shadow-[8px_8px_0_rgba(2,2,2,.05)] md:mb-12 md:p-8">
-                <div className="absolute -left-px -right-px -top-px h-1 bg-red" />
-                <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between md:gap-8">
-                  <div>
-                    <div className="kicker mb-2">Homepage form · {defaultQ.status}</div>
-                    <h2 className="text-[24px] font-semibold leading-tight tracking-tight md:text-[32px]">{defaultQ.name}</h2>
-                    <p className="mb-4 mt-2 max-w-[760px] text-muted">{defaultQ.purpose}</p>
-                    <div className="flex flex-wrap items-center gap-3 text-[13px] text-muted md:gap-4">
-                      <strong className="font-semibold text-ink">{qCount(defaultQ.sections)} questions</strong>
+              <div className="pinned">
+                <div className="pinned-inner">
+                  <div className="pinned-main">
+                    <div className="pinned-kicker"><Icon name="star" className="xs" /> Pinned · Homepage form</div>
+                    <div className="pinned-title">{defaultQ.name}</div>
+                    <div className="pinned-desc">{defaultQ.purpose}</div>
+                    <div className="pinned-meta">
+                      <span>{qCount(defaultQ.sections)} questions</span>
                       <span>{logicCount(defaultQ.sections)} conditional</span>
                       <span>{responses.filter((r) => r.questionnaireId === defaultQ.id).length} responses</span>
                       <span className="mono">/{defaultQ.slug}</span>
                     </div>
                   </div>
-                  <div className="flex gap-2">
-                    <button className="btn btn-ghost btn-sm" onClick={() => copyText(publicUrl(defaultQ), 'Link copied')}>Copy link</button>
-                    <button className="btn btn-red btn-sm" onClick={() => openEditor(defaultQ.id)}>Edit</button>
-                  </div>
+                  <span className={`status ${statusClass(defaultQ.status)}`}>{defaultQ.status}</span>
+                  <button className="btn sm" onClick={() => openShare(defaultQ)}><Icon name="share" className="xs" />Share</button>
+                  <button className="btn sm primary" onClick={() => openBuilder(defaultQ.id)}><Icon name="form" className="xs" />Open builder</button>
                 </div>
               </div>
             )}
-            {!defaultQ && (
-              <div className="mb-8 border border-dashed border-line-strong bg-white p-6 md:mb-12 md:p-8">
-                <h2 className="text-[22px] font-semibold">No homepage form yet</h2>
-                <p className="mt-2 max-w-[620px] text-sm text-muted">Create a questionnaire and choose “Use as homepage form”.</p>
+            <div className="lifecycle-tabs">
+              {['all', 'live', 'draft', 'closed', 'archived', 'trash'].map((status) => (
+                <button key={status} className={`lifecycle-tab ${qStatusFilter === status ? 'active' : ''}`} onClick={() => setQStatusFilter(status)}>{status[0].toUpperCase() + status.slice(1)}</button>
+              ))}
+            </div>
+            <div className="toolbar">
+              <div className="search-box"><Icon name="search" className="sm" /><input placeholder="Search questionnaires" value={qSearch} onChange={(e) => setQSearch(e.target.value)} /></div>
+              <div className="spacer" />
+            </div>
+            {qStatusFilter === 'trash' && (
+              <div className="subtle-banner">
+                <Icon name="trash" className="sm" />
+                <div><strong>Trash is recoverable until you delete it permanently.</strong> Restore questionnaires here, or delete them if you are sure.</div>
               </div>
             )}
-
-            <div className="mb-4 flex flex-col gap-3 md:flex-row md:items-end md:justify-between md:gap-6">
-              <div>
-                <h2 className="text-[24px] font-semibold leading-tight tracking-tight md:text-[30px]">Your questionnaires</h2>
-                <p className="text-sm text-muted">Client-specific and purpose-built discovery flows.</p>
-              </div>
-            </div>
-            <div className="mb-4 flex flex-col gap-3 md:flex-row md:items-center md:justify-between md:gap-4">
-              <input className="input w-full md:w-80" placeholder="Search questionnaires" value={qSearch} onChange={(e) => setQSearch(e.target.value)} />
-              <select className="v6-select w-full md:w-40" value={qStatusFilter} onChange={(e) => setQStatusFilter(e.target.value)}>
-                <option value="all">All statuses</option>
-                <option value="live">Live</option>
-                <option value="draft">Draft</option>
-              </select>
-            </div>
-            <div className="border-t border-ink">
-              {filteredQuestionnaires.length === 0 ? (
-                <div className="border border-dashed border-line-strong bg-white p-8 text-center md:p-12">
-                  <h3 className="text-[22px] font-semibold">No questionnaires found.</h3>
-                  <p className="mx-auto mb-6 mt-2 max-w-[520px] text-muted">Change your search or create a focused client questionnaire.</p>
-                  <button className="btn btn-red" onClick={() => setShowCreateModal(true)}>Create questionnaire</button>
-                </div>
-              ) : filteredQuestionnaires.map((q) => (
-                <button key={q.id} onClick={() => openEditor(q.id)} className="selectable-row grid w-full cursor-pointer grid-cols-1 items-center gap-3 border-b border-line px-2 py-4 text-left md:grid-cols-[minmax(0,1.4fr)_minmax(180px,.7fr)_130px_150px] md:gap-4 md:py-6">
-                  <div>
-                    <div className="text-[15px] font-semibold md:text-[17px]">{q.name}</div>
-                    <div className="text-[13px] text-muted">{q.purpose}</div>
-                  </div>
-                  <div className="hidden mono text-[13px] text-muted md:block">/{q.slug}</div>
-                  <div className="hidden md:block"><span className={`font-mono text-[10px] font-semibold uppercase tracking-wide ${q.status === 'live' ? 'text-red' : 'text-muted'}`}>{q.status}</span></div>
-                  <div className="hidden text-[13px] text-muted md:block">{responses.filter((r) => r.questionnaireId === q.id).length} responses</div>
-                </button>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {/* --- EDITOR --- */}
-        {page === 'editor' && currentQ && (
-          <div>
-            <div className="mb-6 flex items-center gap-2 text-[13px] text-muted">
-              <button onClick={() => goPage('questionnaires')} className="hover:text-red">Questionnaires</button>
-              <span>/</span>
-              <span>{currentQ.name}</span>
-            </div>
-            <div className="flex flex-col gap-4 border-b border-ink pb-6 md:flex-row md:items-end md:justify-between md:gap-8">
-              <div>
-                <div className="kicker mb-2">{currentQ.isDefault ? 'Homepage form' : 'Questionnaire'} · {currentQ.status}</div>
-                <h1 className="mt-2 text-[28px] font-semibold leading-none tracking-tight md:text-[40px]">{currentQ.name}</h1>
-                <div className="mt-3 flex flex-wrap items-center gap-3 text-[13px] text-muted md:gap-4">
-                  <span className="mono">/{currentQ.slug}</span>
-                  <span>{qCount(currentQ.sections)} questions</span>
-                  <span>{responses.filter((r) => r.questionnaireId === currentQ.id).length} responses</span>
-                </div>
-              </div>
-              <div className="flex gap-2">
-                <button className="btn btn-ghost btn-sm" onClick={() => copyText(publicUrl(currentQ), 'Link copied')}>Copy link</button>
-                {!currentQ.isDefault && (
-                  <button className="btn btn-ghost btn-sm" onClick={() => makeHomepageForm(currentQ)}>Make homepage form</button>
-                )}
-                <button className="btn btn-red btn-sm" onClick={() => toggleStatus(currentQ)}>
-                  {currentQ.status === 'live' ? 'Unpublish' : 'Publish'}
-                </button>
-                {!currentQ.isDefault && (
-                  <button className="btn btn-danger btn-sm" onClick={() => handleDeleteQuestionnaire(currentQ)}>Delete</button>
-                )}
-              </div>
-            </div>
-
-            <div className="flex gap-6 overflow-auto border-b border-line md:gap-8">
-              {(['questions', 'design', 'settings'] as const).map((tab) => (
-                <button key={tab} onClick={() => setEditorTab(tab)} className={`relative shrink-0 border-0 bg-transparent px-0 py-4 text-[15px] ${editorTab === tab ? 'font-semibold text-ink' : 'text-muted'}`}>
-                  {tab[0].toUpperCase() + tab.slice(1)}
-                  {editorTab === tab && <span className="absolute inset-x-0 -bottom-px h-[3px] bg-red" />}
-                </button>
-              ))}
-            </div>
-
-            {editorTab === 'questions' && (
-              <div className="mt-6">
-                <div className="grid min-h-[400px] grid-cols-1 border border-line-strong bg-white shadow-[8px_8px_0_rgba(2,2,2,.035)] lg:min-h-[680px] lg:grid-cols-[360px_minmax(0,1fr)]">
-                  <aside className="flex min-w-0 flex-col border-b border-line lg:border-b-0 lg:border-r">
-                    <div className="border-b border-line p-4 md:p-6">
-                      <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
-                        <h3 className="text-lg font-semibold">Questions</h3>
-                        <div className="flex gap-2">
-                          <button className="btn btn-ghost btn-sm" onClick={() => {
-                            const title = prompt('Section title:')
-                            if (title) addNewSection(currentQ, title)
-                          }}>+ Section</button>
-                          <button className="btn btn-red btn-sm" onClick={() => {
-                            const section = currentQ.sections[0]
-                            if (section) addNewQuestion(currentQ, section.id)
-                            else showToast('Add a section first')
-                          }}>+ Question</button>
-                        </div>
-                      </div>
-                      <input className="input" style={{ height: 40 }} placeholder="Search questions" value={questionSearch} onChange={(e) => setQuestionSearch(e.target.value)} />
-                      <div className="mt-4 flex flex-wrap gap-3 md:gap-4">
-                        {['all', 'required', 'conditional', 'inactive'].map((f) => (
-                          <button key={f} onClick={() => setQuestionFilter(f)} className={`border-0 bg-transparent p-0 font-mono text-[10px] font-semibold uppercase tracking-wide ${questionFilter === f ? 'text-red' : 'text-muted'}`}>{f}</button>
-                        ))}
-                      </div>
-                    </div>
-                    <div className="max-h-[420px] overflow-auto pb-4 lg:max-h-[640px]">
-                      {currentQ.sections.map((s, si) => {
-                        const filtered = s.questions.filter((q) => {
-                          const search = questionSearch.toLowerCase()
-                          const hit = !search || (q.question + ' ' + (q.helpText || '')).toLowerCase().includes(search)
-                          const cond = !!q.logic?.showWhen?.conditions?.length
-                          const match = questionFilter === 'all' ||
-                            (questionFilter === 'required' && q.required) ||
-                            (questionFilter === 'conditional' && cond) ||
-                            (questionFilter === 'inactive' && !q.active)
-                          return hit && match
-                        })
-                        if (!filtered.length && (questionSearch || questionFilter !== 'all')) return null
-                        return (
-                          <div key={s.id} className="border-b border-line">
-                            <div className="flex w-full items-center justify-between bg-surface-muted px-4 py-3 text-left md:px-6 md:py-4">
-                              <strong className="text-xs uppercase tracking-wider">{String(si + 1).padStart(2, '0')} · {s.title}</strong>
-                              <span className="mono text-[10px] text-muted">{filtered.length}/{s.questions.length}</span>
+            <div className="table-card">
+              <table>
+                <thead><tr><th>Questionnaire</th><th>Status</th><th>Questions</th><th>Responses</th><th>Updated</th><th /></tr></thead>
+                <tbody>
+                  {filteredQuestionnaires.length === 0 ? (
+                    <tr><td colSpan={6}><div className="response-empty">No questionnaires in this view.</div></td></tr>
+                  ) : filteredQuestionnaires.map((q) => (
+                    <tr key={q.id}>
+                      <td>
+                        <button onClick={() => openBuilder(q.id)} className="item-title" style={{ background: 'none', border: 0, padding: 0 }}>{q.name}</button>
+                        <div className="item-sub">{q.purpose || `/${q.slug}`}</div>
+                      </td>
+                      <td><span className={`status ${statusClass(q.status)}`}>{q.status}</span></td>
+                      <td>{qCount(q.sections)}</td>
+                      <td>{responses.filter((r) => r.questionnaireId === q.id).length}</td>
+                      <td>{q.updatedAt ? new Date(q.updatedAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '—'}</td>
+                      <td>
+                        <div className="row-actions">
+                          <details className="details-menu">
+                            <summary className="more-btn"><Icon name="more" className="sm" /></summary>
+                            <div className="menu-pop">
+                              <button className="menu-item" onClick={() => openBuilder(q.id)}><Icon name="form" className="sm" />Open builder</button>
+                              <button className="menu-item" onClick={() => openShare(q)}><Icon name="share" className="sm" />Share</button>
+                              <button className="menu-item" onClick={() => void duplicateQuestionnaire(q)}><Icon name="copy" className="sm" />Duplicate</button>
+                              {!q.isDefault && q.status !== 'trash' && <button className="menu-item" onClick={() => void makeHomepageForm(q)}>Use as homepage form</button>}
+                              <div className="menu-sep" />
+                              {q.status !== 'live' && q.status !== 'trash' && <button className="menu-item" onClick={() => void setQStatus(q, 'live')}>Publish</button>}
+                              {q.status === 'live' && <button className="menu-item" onClick={() => void setQStatus(q, 'closed')}>Close responses</button>}
+                              {q.status === 'live' && <button className="menu-item" onClick={() => void setQStatus(q, 'draft')}>Unpublish</button>}
+                              {q.status !== 'archived' && q.status !== 'trash' && <button className="menu-item" onClick={() => void setQStatus(q, 'archived')}>Archive</button>}
+                              {q.status === 'trash' && <button className="menu-item" onClick={() => void setQStatus(q, 'draft')}>Restore</button>}
+                              {q.status !== 'trash' && <button className="menu-item danger" onClick={() => void handleDeleteQuestionnaire(q, false)}><Icon name="trash" className="sm" />Move to trash</button>}
+                              {q.status === 'trash' && <button className="menu-item danger" onClick={() => void handleDeleteQuestionnaire(q, true)}>Delete permanently</button>}
                             </div>
-                            {filtered.map((q) => {
-                              const cond = !!q.logic?.showWhen?.conditions?.length
-                              const active = currentQuestionId === q.id
-                              return (
-                                <button
-                                  key={q.id}
-                                  onClick={() => setCurrentQuestionId(q.id)}
-                                  className={`grid w-full grid-cols-[16px_minmax(0,1fr)_auto] items-start gap-2 border-0 px-4 py-3 text-left md:px-6 md:py-4 ${active ? 'bg-ink text-white' : 'bg-transparent hover:bg-canvas'}`}
-                                >
-                                  <span className="text-xs tracking-[-2px] text-muted">⋮⋮</span>
-                                  <span className="text-[13px] font-medium leading-snug">{q.question}</span>
-                                  <span className="flex items-center gap-1">
-                                    {q.required && <span className={`font-mono text-[9px] font-semibold uppercase ${active ? 'text-[#FF8389]' : 'text-red'}`}>Required</span>}
-                                    {cond && <span className={`font-mono text-[9px] font-semibold uppercase ${active ? 'text-[#FF8389]' : 'text-red'}`}>IF</span>}
-                                    {!q.active && <span className={`font-mono text-[9px] font-semibold uppercase ${active ? 'text-[#FF8389]' : 'text-red'}`}>Off</span>}
-                                  </span>
-                                </button>
-                              )
-                            })}
-                          </div>
-                        )
-                      })}
-                    </div>
-                  </aside>
-
-                  <section className="min-w-0 p-4 md:p-8">
-                    {currentQuestion ? (
-                      <QuestionInspector
-                        question={currentQuestion}
-                        allQuestions={currentQ.sections.flatMap((s) => s.questions)}
-                        onSave={(q) => saveQuestion(currentQ, q)}
-                        onDelete={() => deleteSelectedQuestion(currentQ, currentQuestion.id)}
-                      />
-                    ) : (
-                      <div className="flex h-full items-center justify-center text-sm text-muted">Select a question to edit.</div>
-                    )}
-                  </section>
-                </div>
-              </div>
-            )}
-
-            {editorTab === 'design' && (
-              <DesignTab questionnaire={currentQ} onUpdate={async (theme) => {
-                try {
-                  const res = await fetch(`/api/adl/questionnaires/${currentQ.id}`, {
-                    method: 'PUT', headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ theme }),
-                  })
-                  if (!res.ok) { showToast('Failed to save design'); return }
-                  const data = await res.json() as { questionnaire: QuestionnaireData }
-                  setQuestionnaires((prev) => prev.map((x) => x.id === currentQ.id ? data.questionnaire : x))
-                  showToast('Design saved')
-                } catch (err) { showError(err) }
-              }} />
-            )}
-
-            {editorTab === 'settings' && (
-              <QuestionnaireSettingsTab
-                questionnaire={currentQ}
-                onSave={async (input) => {
-                  try {
-                    const res = await fetch(`/api/adl/questionnaires/${currentQ.id}`, {
-                      method: 'PUT', headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify(input),
-                    })
-                    if (!res.ok) { showToast('Failed to save settings'); return }
-                    const data = await res.json() as { questionnaire: QuestionnaireData }
-                    setQuestionnaires((prev) => prev.map((x) => {
-                      if (x.id === currentQ.id) return data.questionnaire
-                      if (input.isDefault) return { ...x, isDefault: false }
-                      return x
-                    }))
-                    showToast(input.isDefault ? 'This form now opens on the public homepage' : 'Settings saved')
-                  } catch (err) { showError(err) }
-                }}
-              />
-            )}
-          </div>
+                          </details>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </section>
         )}
 
-        {/* --- RESPONSES --- */}
-        {page === 'responses' && (
-          <div>
-            <div className="mb-8 flex flex-col gap-4 md:mb-12 md:flex-row md:items-end md:justify-between md:gap-8">
-              <div>
-                <div className="kicker">Responses</div>
-                <h1 className="mt-2 text-[clamp(32px,4.6vw,56px)] font-semibold leading-none tracking-[-0.045em]">Client submissions</h1>
-                <p className="mt-4 max-w-[760px] text-base leading-relaxed text-muted">A focused inbox for what is new, what is clear, and what still needs a conversation.</p>
+        {page === 'builder' && currentQ && (
+          <section className="page builder-page">
+            <div className="builder-top">
+              <button className="icon-btn" onClick={() => goPage('questionnaires')}><Icon name="arrow-left" className="sm" /></button>
+              <div className="builder-title"><strong>{currentQ.name}</strong><span className="mono">/{currentQ.slug}</span></div>
+              <div className="builder-save">Saved</div>
+              <span className="version-chip">{currentQ.status === 'live' ? 'Live' : currentQ.status}</span>
+              <div className="spacer" />
+              <div className="segmented">
+                <button className={previewDevice === 'desktop' ? 'active' : ''} onClick={() => setPreviewDevice('desktop')}><Icon name="monitor" className="xs" /></button>
+                <button className={previewDevice === 'mobile' ? 'active' : ''} onClick={() => setPreviewDevice('mobile')}><Icon name="phone" className="xs" /></button>
               </div>
-              <div className="flex flex-col gap-2 md:items-end">
-                <input className="input w-full md:w-80" placeholder="Search responses" value={responseSearch} onChange={(e) => setResponseSearch(e.target.value)} />
-                <div className="flex flex-wrap gap-2">
-                  <button className="btn btn-ghost btn-sm" onClick={() => exportResponses(filteredResponses, 'excel', 'intake-responses')} disabled={!filteredResponses.length}>Excel</button>
-                  <button className="btn btn-ghost btn-sm" onClick={() => exportResponses(filteredResponses, 'json', 'intake-responses')} disabled={!filteredResponses.length}>JSON</button>
-                  <button className="btn btn-ghost btn-sm" onClick={() => exportResponses(filteredResponses, 'md', 'intake-responses')} disabled={!filteredResponses.length}>Markdown</button>
+              <button className="btn sm" onClick={() => openShare(currentQ)}><Icon name="share" className="xs" />Share</button>
+              <details className="details-menu">
+                <summary className="more-btn"><Icon name="more" className="sm" /></summary>
+                <div className="menu-pop">
+                  <button className="menu-item" onClick={() => window.open('/' + currentQ.slug.replace(/^\//, ''), '_blank')}><Icon name="eye" className="sm" />Preview questionnaire</button>
+                  <button className="menu-item" onClick={() => void duplicateQuestionnaire(currentQ)}><Icon name="copy" className="sm" />Duplicate</button>
+                  <div className="menu-sep" />
+                  {currentQ.status === 'live' ? <button className="menu-item" onClick={() => void setQStatus(currentQ, 'closed')}>Close responses</button> : <button className="menu-item" onClick={() => void setQStatus(currentQ, 'live')}>Publish</button>}
+                  <button className="menu-item danger" onClick={() => void handleDeleteQuestionnaire(currentQ, currentQ.status === 'trash')}><Icon name="trash" className="sm" />Move to trash</button>
                 </div>
+              </details>
+              <button className="btn sm primary" onClick={() => void setQStatus(currentQ, currentQ.status === 'live' ? 'draft' : 'live')}>
+                {currentQ.status === 'live' ? 'Unpublish' : 'Publish'}
+              </button>
+            </div>
+            <div className="builder">
+              <aside className="panel structure">
+                <div className="panel-head">
+                  <strong>Structure</strong>
+                  <div className="spacer" />
+                  <button className="mini-add" title="Add section" onClick={() => { const title = prompt('Section title:'); if (title) addNewSection(currentQ, title) }}><Icon name="plus" className="xs" /></button>
+                </div>
+                <div className="struct-search"><div className="search-box"><Icon name="search" className="xs" /><input placeholder="Search questions" value={questionSearch} onChange={(e) => setQuestionSearch(e.target.value)} /></div></div>
+                {currentQ.sections.map((section, si) => {
+                  const filtered = section.questions.filter((q) => !questionSearch || q.question.toLowerCase().includes(questionSearch.toLowerCase()))
+                  const collapsed = collapsedSections[section.id]
+                  return (
+                    <div key={section.id} className={`section-block ${collapsed ? 'collapsed' : ''}`}>
+                      <button className="section-head" onClick={() => setCollapsedSections((prev) => ({ ...prev, [section.id]: !prev[section.id] }))}>
+                        <span className="section-no">{String(si + 1).padStart(2, '0')}</span>
+                        <span className="section-name">{section.title}</span>
+                        <span className="section-count">{filtered.length}</span>
+                        <button className="mini-add" onClick={(e) => { e.stopPropagation(); addNewQuestion(currentQ, section.id) }}><Icon name="plus" className="xs" /></button>
+                      </button>
+                      {!collapsed && filtered.map((q) => (
+                        <button key={q.id} className={`q-item ${currentQuestionId === q.id ? 'active' : ''} ${q.active === false ? 'inactive' : ''}`} onClick={() => { setCurrentQuestionId(q.id); setPreviewPick('') }}>
+                          <span className="drag">⋮⋮</span>
+                          <span className="q-type-icon">{TYPE_LABELS[q.type].slice(0, 2).toUpperCase()}</span>
+                          <span className="q-copy">
+                            <span className="q-title">{q.question}</span>
+                            <span className="q-flags">
+                              {q.required && <span className="tiny-flag">Req</span>}
+                              {q.logic?.showWhen?.conditions?.length ? <span className="tiny-flag">If</span> : null}
+                              {!q.active && <span className="tiny-flag">Off</span>}
+                            </span>
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  )
+                })}
+              </aside>
+              <section className="preview-stage">
+                <div className={`preview-shell ${previewDevice === 'mobile' ? 'mobile' : ''}`}>
+                  <div className="preview-brand">{currentQ.theme.showLogo !== false && <AppsrowLogo className="h-auto w-[105px]" />}</div>
+                  <div className="preview-progress"><span style={{ width: currentQuestion && currentQ ? `${Math.max(8, (currentQ.sections.flatMap((s) => s.questions).findIndex((q) => q.id === currentQuestion.id) + 1) / Math.max(qCount(currentQ.sections), 1) * 100)}%` : '8%' }} /></div>
+                  <div className="preview-body">
+                    {currentQuestion ? (
+                      <>
+                        <div className="preview-step">Question {(currentQ.sections.flatMap((s) => s.questions).findIndex((q) => q.id === currentQuestion.id) + 1) || 1} of {qCount(currentQ.sections)}</div>
+                        <div className="preview-question">{currentQuestion.question}</div>
+                        {currentQuestion.helpText && <div className="preview-help">{currentQuestion.helpText}</div>}
+                        {isChoiceType(currentQuestion.type) ? (
+                          <div className="options">
+                            {currentQuestion.options.map((opt) => (
+                              <button key={opt} className={`option ${previewPick === opt ? 'selected' : ''}`} onClick={() => setPreviewPick(opt)}>
+                                <span className={`radio ${currentQuestion.type === 'multi_select' ? 'square' : ''}`} />
+                                <span>{opt}</span>
+                              </button>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="field" style={{ marginTop: 26 }}>
+                            {currentQuestion.type === 'long_text'
+                              ? <textarea className="textarea" placeholder={currentQuestion.placeholder || 'Your answer...'} readOnly />
+                              : <input className="input" placeholder={currentQuestion.placeholder || 'Your answer...'} readOnly />}
+                          </div>
+                        )}
+                        <div className="preview-foot">
+                          <span className="preview-hint">Live preview · answers are not saved</span>
+                          <button className="btn primary" onClick={() => {
+                            const all = currentQ.sections.flatMap((s) => s.questions)
+                            const idx = all.findIndex((q) => q.id === currentQuestion.id)
+                            if (idx >= 0 && all[idx + 1]) { setCurrentQuestionId(all[idx + 1].id); setPreviewPick('') }
+                          }}>Continue</button>
+                        </div>
+                      </>
+                    ) : <div className="preview-help">Select a question to preview it.</div>}
+                  </div>
+                </div>
+              </section>
+              <aside className="panel properties">
+                {currentQuestion ? (
+                  <QuestionInspector
+                    question={currentQuestion}
+                    allQuestions={currentQ.sections.flatMap((s) => s.questions)}
+                    onSave={(q) => saveQuestion(currentQ, q)}
+                    onDelete={() => deleteSelectedQuestion(currentQ, currentQuestion.id)}
+                  />
+                ) : (
+                  <div className="response-empty">Select a question to edit its settings.</div>
+                )}
+                <div className="prop-section">
+                  <div className="prop-section-title">Questionnaire</div>
+                  <div className="switch-row">
+                    <div><div className="switch-title">Homepage form</div><div className="switch-sub">Opens on the public site root.</div></div>
+                    <button className={`switch ${currentQ.isDefault ? 'on' : ''}`} onClick={() => { if (!currentQ.isDefault) void makeHomepageForm(currentQ) }}><span /></button>
+                  </div>
+                </div>
+              </aside>
+            </div>
+          </section>
+        )}
+
+        {page === 'responses' && (
+          <section className="page">
+            <div className="page-head">
+              <div>
+                <div className="eyebrow">Inbox</div>
+                <h1>Client responses</h1>
+                <p className="page-sub">Review submissions without changing the original answers. Use notes, lifecycle states and exports to keep qualification moving.</p>
+              </div>
+              <div className="head-actions">
+                <button className="btn" disabled={!filteredResponses.length} onClick={() => exportResponses(filteredResponses, 'excel', 'intake-responses')}><Icon name="download" className="sm" />Excel</button>
+                <button className="btn" disabled={!filteredResponses.length} onClick={() => exportResponses(filteredResponses, 'json', 'intake-responses')}>JSON</button>
+                <button className="btn" disabled={!filteredResponses.length} onClick={() => exportResponses(filteredResponses, 'md', 'intake-responses')}>Markdown</button>
               </div>
             </div>
-            <div className="mb-6 grid grid-cols-1 gap-3 md:grid-cols-3">
-              <div>
-                <label className="mb-2 block text-[13px] font-semibold">Questionnaire</label>
-                <select className="v6-select" value={responseQuestionnaire} onChange={(e) => setResponseQuestionnaire(e.target.value)}>
+            <div className="lifecycle-tabs">
+              {['all', 'new', 'reviewed', 'incomplete', 'archived', 'trash'].map((status) => (
+                <button key={status} className={`lifecycle-tab ${responseFilter === status ? 'active' : ''}`} onClick={() => setResponseFilter(status)}>{status[0].toUpperCase() + status.slice(1)}</button>
+              ))}
+            </div>
+            <div className="toolbar">
+              <div className="search-box"><Icon name="search" className="sm" /><input placeholder="Search people, companies or answers" value={responseSearch} onChange={(e) => setResponseSearch(e.target.value)} /></div>
+              <div className="spacer" />
+              <div className="select-box">
+                <select value={responseQuestionnaire} onChange={(e) => setResponseQuestionnaire(e.target.value)}>
                   <option value="all">All questionnaires</option>
                   {questionnaires.map((q) => <option key={q.id} value={q.id}>{q.name}</option>)}
                 </select>
               </div>
-              <div>
-                <label className="mb-2 block text-[13px] font-semibold">Need / project type</label>
-                <select className="v6-select" value={responseProjectType} onChange={(e) => setResponseProjectType(e.target.value)}>
+              <div className="select-box">
+                <select value={responseProjectType} onChange={(e) => setResponseProjectType(e.target.value)}>
                   <option value="all">All needs</option>
                   {projectTypeOptions.map((type) => <option key={type} value={type}>{type}</option>)}
                 </select>
               </div>
-              <div>
-                <label className="mb-2 block text-[13px] font-semibold">Submitted</label>
-                <select className="v6-select" value={responseDate} onChange={(e) => setResponseDate(e.target.value)}>
+              <div className="select-box">
+                <select value={responseDate} onChange={(e) => setResponseDate(e.target.value)}>
                   <option value="all">Any time</option>
                   <option value="today">Today</option>
                   <option value="7d">Last 7 days</option>
@@ -606,157 +746,196 @@ export function AdminWorkspace({
                 </select>
               </div>
             </div>
-            <div className="grid grid-cols-1 gap-6 md:grid-cols-[220px_minmax(0,1fr)] md:gap-8">
-              <aside className="flex overflow-auto border-b border-line md:block md:border-b-0 md:border-t md:border-ink">
-                {(['all', 'new', 'reviewed', 'incomplete'] as const).map((f) => (
-                  <button key={f} onClick={() => setResponseFilter(f)} className={`flex w-auto min-w-max items-center gap-2 border-b-0 px-3 py-3 text-left md:w-full md:justify-between md:border-b md:border-line md:px-0 md:py-4 ${responseFilter === f ? 'font-semibold text-ink' : 'text-muted'}`}>
-                    {f[0].toUpperCase() + f.slice(1)}
-                    <span className="mono text-[11px]">{responseCounts[f]}</span>
-                  </button>
-                ))}
-              </aside>
-              <div className="grid gap-2">
-                {filteredResponses.length === 0 ? (
-                  <div className="border border-dashed border-line-strong bg-white p-8 text-center md:p-12">
-                    <h3 className="text-[22px] font-semibold">No responses here.</h3>
-                    <p className="text-muted">Try another filter or search.</p>
+            {selectedResponses.length > 0 && (
+              <div className="bulk-bar">
+                <strong>{selectedResponses.length} selected</strong>
+                <div className="spacer" />
+                <button className="btn sm" onClick={() => { selectedResponses.forEach((id) => { const r = responses.find((x) => x.id === id); if (r) void setResponseStatus(r, 'reviewed') }); setSelectedResponses([]) }}>Mark reviewed</button>
+                <button className="btn sm" onClick={() => { selectedResponses.forEach((id) => { const r = responses.find((x) => x.id === id); if (r) void setResponseStatus(r, 'archived') }); setSelectedResponses([]) }}>Archive</button>
+                <button className="btn sm" onClick={() => exportResponses(responses.filter((r) => selectedResponses.includes(r.id)), 'excel', 'selected-responses')}>Export</button>
+                <button className="btn sm danger" onClick={() => { selectedResponses.forEach((id) => { const r = responses.find((x) => x.id === id); if (r) void setResponseStatus(r, 'trash') }); setSelectedResponses([]) }}>Move to trash</button>
+              </div>
+            )}
+            {responseFilter === 'trash' && (
+              <div className="subtle-banner"><Icon name="trash" className="sm" /><div><strong>Deleted submissions stay in Trash until permanently deleted.</strong></div></div>
+            )}
+            <div className="responses-layout">
+              <div className="response-list">
+                <div className="response-list-head">
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <input type="checkbox" className="table-check" checked={filteredResponses.length > 0 && selectedResponses.length === filteredResponses.length} onChange={(e) => setSelectedResponses(e.target.checked ? filteredResponses.map((r) => r.id) : [])} />
+                    <strong style={{ fontSize: 12 }}>Responses</strong>
+                    <span style={{ fontSize: 10, color: 'var(--muted-2)' }}>{filteredResponses.length}</span>
                   </div>
-                ) : filteredResponses.map((r) => (
-                  <button key={r.id} onClick={() => openResponseDetail(r.id)} className="selectable-row grid cursor-pointer grid-cols-[1fr_auto] items-center gap-3 px-4 py-4 md:grid-cols-[minmax(0,1.4fr)_minmax(160px,.7fr)_110px_90px] md:gap-4 md:py-5">
-                    <div>
-                      <strong className="block text-base">{r.name}</strong>
-                      <span className="text-[13px] text-muted">
-                        {[!isPlaceholderValue(r.email) ? r.email : '', !isPlaceholderValue(r.company) ? r.company : '', r.questionnaireName].filter(Boolean).join(' · ')}
-                      </span>
+                </div>
+                {filteredResponses.length === 0 && <div className="response-empty">No responses here.</div>}
+                {filteredResponses.map((r) => (
+                  <div key={r.id} className={`response-item ${currentResponseId === r.id ? 'active' : ''}`} onClick={() => setCurrentResponseId(r.id)}>
+                    <input type="checkbox" className="table-check" checked={selectedResponses.includes(r.id)} onClick={(e) => e.stopPropagation()} onChange={(e) => setSelectedResponses((prev) => e.target.checked ? [...prev, r.id] : prev.filter((id) => id !== r.id))} />
+                    <div className="person-avatar">{initials(r.name)}</div>
+                    <div className="response-main">
+                      <div className="response-name">{r.name}</div>
+                      <div className="response-company">{[!isPlaceholderValue(r.company) ? r.company : '', r.projectType || r.questionnaireName].filter(Boolean).join(' · ')}</div>
                     </div>
-                    <div className="hidden text-[13px] text-muted md:block">{r.projectType || '—'}</div>
-                    <div className="hidden md:block"><span className={`badge ${r.status === 'new' ? 'red' : ''}`}>{r.status}</span></div>
-                    <div className="text-right text-[12px] text-muted">{r.submittedAt}</div>
-                  </button>
+                    <div className="response-time">{r.submittedAt}</div>
+                  </div>
                 ))}
               </div>
+              <div className="response-detail">
+                {currentResponse ? (
+                  <>
+                    <div className="response-detail-head">
+                      <div className="person-avatar">{initials(currentResponse.name)}</div>
+                      <div className="response-detail-meta">
+                        <h2>{currentResponse.name}</h2>
+                        <div className="meta-line">{[!isPlaceholderValue(currentResponse.company) ? currentResponse.company : '', !isPlaceholderValue(currentResponse.email) ? currentResponse.email : ''].filter(Boolean).join(' · ')}</div>
+                        <div className="meta-line">Submitted {currentResponse.submittedAt} · {currentResponse.questionnaireName}</div>
+                      </div>
+                      <div className="detail-state-actions">
+                        <span className={`status ${statusClass(currentResponse.status)}`}>{currentResponse.status}</span>
+                        {currentResponse.status !== 'reviewed' && <button className="btn sm" onClick={() => void setResponseStatus(currentResponse, 'reviewed')}>Mark reviewed</button>}
+                        {currentResponse.status === 'reviewed' && <button className="btn sm" onClick={() => void setResponseStatus(currentResponse, 'new')}>Mark new</button>}
+                        {currentResponse.status !== 'archived' && currentResponse.status !== 'trash' && <button className="btn sm" onClick={() => void setResponseStatus(currentResponse, 'archived')}>Archive</button>}
+                        {currentResponse.status === 'trash' ? (
+                          <>
+                            <button className="btn sm" onClick={() => void setResponseStatus(currentResponse, 'new')}>Restore</button>
+                            <button className="btn sm danger" onClick={() => void deleteResponsePermanently(currentResponse)}>Delete</button>
+                          </>
+                        ) : (
+                          <button className="btn sm danger" onClick={() => void setResponseStatus(currentResponse, 'trash')}>Trash</button>
+                        )}
+                      </div>
+                    </div>
+                    <div className="response-content">
+                      <div className="subtle-banner"><Icon name="lock" className="sm" /><div><strong>Original answers are read-only.</strong> Add notes for corrections or follow-up.</div></div>
+                      {Object.keys(currentResponse.snapshot).length > 0 && (
+                        <div className="response-summary">
+                          {Object.entries(currentResponse.snapshot).slice(0, 4).map(([k, v]) => (
+                            <div key={k} className="summary-tile"><div className="summary-label">{k}</div><div className="summary-value">{v}</div></div>
+                          ))}
+                        </div>
+                      )}
+                      <div className="answer-section">
+                        <div className="answer-section-title">Full responses</div>
+                        {currentResponse.answers.map(([q, a]) => (
+                          <div key={q} className="answer"><div className="answer-q">{q}</div><div className="answer-a">{a || '—'}</div></div>
+                        ))}
+                      </div>
+                      <div className="note-box">
+                        <div className="label">Internal notes</div>
+                        <div className="notes-list">
+                          {(currentResponse.notes || []).map((note) => (
+                            <div key={note.id} className="note-item">
+                              <div className="note-head"><span className="note-author">{note.author}</span><span>{note.time}</span></div>
+                              <div className="note-body">{note.body}</div>
+                            </div>
+                          ))}
+                        </div>
+                        <textarea placeholder="Add a note for the team…" value={noteDraft} onChange={(e) => setNoteDraft(e.target.value)} />
+                        <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 8 }}>
+                          <button className="btn sm primary" onClick={() => void addNote(currentResponse, noteDraft)}>Add note</button>
+                        </div>
+                      </div>
+                    </div>
+                  </>
+                ) : <div className="response-empty">Select a response to review it.</div>}
+              </div>
             </div>
-          </div>
+          </section>
         )}
 
-        {page === 'response-detail' && currentResponse && (
-          <ResponseDetailPage
-            response={currentResponse}
-            questionnaireName={currentResponse.questionnaireName || ''}
-            onBack={() => goPage('responses')}
-            onToggleStatus={() => toggleResponseStatus(currentResponse)}
-            onCopyEmail={() => copyText(currentResponse.email, 'Email copied')}
+        {page === 'templates' && (
+          <TemplatesPage
+            questionnaires={questionnaires}
+            onUse={(q) => void handleCreateQuestionnaire({ name: `${q.name} Project`, mode: 'template', sourceId: q.id })}
+            onCreate={() => setShowCreateModal(true)}
           />
         )}
 
         {page === 'settings' && (
-          <WorkspaceSettingsPage
+          <SettingsPage
             workspace={workspace}
-            onSave={async (input) => {
-              try {
-                const res = await fetch('/api/adl/workspace', {
-                  method: 'PUT', headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify(input),
-                })
-                if (!res.ok) { showToast('Failed to save workspace'); return }
-                const data = await res.json() as { workspace: WorkspaceSettings }
-                setWorkspace(data.workspace)
-                showToast('Workspace saved')
-              } catch (err) { showError(err) }
-            }}
+            section={settingsSection}
+            onSection={setSettingsSection}
+            onSave={saveWorkspace}
+            audit={audit}
+            onLogout={() => void handleLogout()}
           />
         )}
-      </main>
 
-      {/* Create modal */}
-      {showCreateModal && <CreateQuestionnaireModal onClose={() => setShowCreateModal(false)} onCreate={handleCreateQuestionnaire} />}
+        {page === 'developer' && (
+          <DeveloperPage
+            onImported={(q) => { setQuestionnaires((prev) => [...prev, q]); showToast(`Imported "${q.name}"`); goPage('questionnaires') }}
+            onStatus={showToast}
+          />
+        )}
+      </div>
 
+      {showCreateModal && (
+        <CreateModal
+          questionnaires={questionnaires}
+          onClose={() => setShowCreateModal(false)}
+          onCreate={handleCreateQuestionnaire}
+        />
+      )}
+      {showShareModal && currentQ && (
+        <div className="modal" onClick={(e) => { if (e.target === e.currentTarget) setShowShareModal(false) }}>
+          <div className="modal-card wide">
+            <div className="modal-head"><h3>Share questionnaire</h3><div style={{ marginLeft: 'auto' }}><button className="more-btn" onClick={() => setShowShareModal(false)}>×</button></div></div>
+            <div className="modal-body">
+              <div className="field">
+                <div className="label">Public URL</div>
+                <div className="share-url">
+                  <input className="input mono" readOnly value={publicUrl(currentQ)} />
+                  <button className="btn" onClick={() => copyText(publicUrl(currentQ), 'Link copied')}>Copy</button>
+                </div>
+              </div>
+              <p className="help">Anyone with the link can open a live questionnaire. Closed or draft forms are not publicly submittable.</p>
+            </div>
+          </div>
+        </div>
+      )}
+      {showCommand && (
+        <div className="modal" onClick={(e) => { if (e.target === e.currentTarget) setShowCommand(false) }}>
+          <div className="command">
+            <div className="command-search"><Icon name="search" className="sm" /><input autoFocus placeholder="Search or jump to…" value={commandQuery} onChange={(e) => setCommandQuery(e.target.value)} /></div>
+            <div className="command-list">
+              <div className="command-group">Go to</div>
+              {(Object.keys(PAGE_TITLES) as Page[]).filter((p) => p !== 'builder' && PAGE_TITLES[p].toLowerCase().includes(commandQuery.toLowerCase())).map((p) => (
+                <button key={p} className="command-item" onClick={() => { setShowCommand(false); goPage(p) }}>{PAGE_TITLES[p]}</button>
+              ))}
+              <div className="command-group">Actions</div>
+              <button className="command-item" onClick={() => { setShowCommand(false); setShowCreateModal(true) }}><Icon name="plus" className="sm" />Create questionnaire<span className="kbd">C</span></button>
+            </div>
+          </div>
+        </div>
+      )}
       <div className={`toast ${toast ? 'show' : ''}`}>{toast}</div>
     </div>
   )
 }
 
-// --- Create Questionnaire Modal ---
-
-function CreateQuestionnaireModal({ onClose, onCreate }: {
-  onClose: () => void
-  onCreate: (input: { name: string; slug: string; purpose: string; mode: string; isDefault?: boolean }) => void
-}) {
-  const [name, setName] = useState('')
-  const [slug, setSlug] = useState('')
-  const [slugTouched, setSlugTouched] = useState(false)
-  const [purpose, setPurpose] = useState('')
-  const [mode, setMode] = useState<'universal' | 'blank'>('universal')
-  const [makeDefault, setMakeDefault] = useState(false)
-  const [error, setError] = useState('')
-
-  function handleNameChange(v: string) {
-    setName(v)
-    if (!slugTouched) setSlug(slugify(v))
-  }
-
-  function handleCreate() {
-    const errors: string[] = []
-    if (!name.trim()) errors.push('Name is required.')
-    if (!isValidSlug(slug)) errors.push('Use a valid lowercase slug.')
-    if (!purpose.trim()) errors.push('Purpose is required.')
-    if (errors.length) { setError(errors.join(' ')); return }
-    onCreate({ name: name.trim(), slug: slug.trim(), purpose: purpose.trim(), mode, isDefault: makeDefault })
-  }
-
+function NavBtn({ icon, label, active, onClick, badge }: { icon: string; label: string; active: boolean; onClick: () => void; badge?: number }) {
   return (
-    <div className="fixed inset-0 z-[200] flex items-center justify-center bg-ink/60 p-4" onClick={(e) => { if (e.target === e.currentTarget) onClose() }}>
-      <div className="w-full max-w-[680px] max-h-[92vh] overflow-auto border border-ink bg-white shadow-[8px_8px_0_rgba(0,0,0,.18)]">
-        <div className="flex items-start justify-between gap-4 border-b border-line p-6 md:p-8">
-          <div>
-            <div className="kicker">Create questionnaire</div>
-            <h2 className="mt-2 text-[28px] font-semibold leading-tight tracking-tight md:text-[32px]">Start with the right base.</h2>
-            <p className="mt-2 text-sm text-muted">Universal is recommended for most projects. You can remove what you do not need.</p>
-          </div>
-          <button className="flex h-10 w-10 shrink-0 items-center justify-center border border-line-strong bg-white text-xl" onClick={onClose}>×</button>
-        </div>
-        <div className="p-6 md:p-8">
-          <div className="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-2">
-            <button onClick={() => setMode('universal')} className={`border p-6 text-left ${mode === 'universal' ? 'border-ink shadow-[4px_4px_0_rgba(2,2,2,.08)]' : 'border-line-strong'} bg-white`}>
-              <div className="mb-2 font-mono text-[9px] font-semibold uppercase tracking-wider text-red">Recommended</div>
-              <strong className="block text-[17px]">Use Universal</strong>
-              <p className="mt-1 text-[13px] text-muted">Clone the default Appsrow discovery structure.</p>
-            </button>
-            <button onClick={() => setMode('blank')} className={`border p-6 text-left ${mode === 'blank' ? 'border-ink shadow-[4px_4px_0_rgba(2,2,2,.08)]' : 'border-line-strong'} bg-white`}>
-              <div className="mb-2 font-mono text-[9px] font-semibold uppercase tracking-wider text-red">Focused</div>
-              <strong className="block text-[17px]">Start blank</strong>
-              <p className="mt-1 text-[13px] text-muted">Create only the sections and questions you need.</p>
-            </button>
-          </div>
-          <div className="mb-4"><label className="mb-2 block text-[13px] font-semibold">Questionnaire name</label><input className="input" placeholder="Client Website Discovery" value={name} onChange={(e) => handleNameChange(e.target.value)} /></div>
-          <div className="mb-4"><label className="mb-2 block text-[13px] font-semibold">Custom slug</label><input className="input mono" placeholder="client-website" value={slug} onChange={(e) => { setSlugTouched(true); setSlug(e.target.value) }} /><p className="mt-1 text-xs text-muted">Lowercase letters, numbers and hyphens only.</p></div>
-          <div className="mb-4"><label className="mb-2 block text-[13px] font-semibold">Purpose</label><textarea className="textarea" placeholder="Collect scope, design readiness and project requirements before discovery." value={purpose} onChange={(e) => setPurpose(e.target.value)} /></div>
-          <button type="button" onClick={() => setMakeDefault(!makeDefault)} className="mb-4 flex w-full items-center justify-between border border-line-strong bg-white px-4 py-4 text-left">
-            <div>
-              <strong className="text-[13px]">Use as homepage form</strong>
-              <p className="text-xs text-muted">Publish this questionnaire on the public site instead of the unavailable page.</p>
-            </div>
-            <span className={`switch ${makeDefault ? 'on' : ''}`} />
-          </button>
-          {error && <div className="mb-4 border-l-[3px] border-red bg-[#FFF7F7] p-4 text-sm">{error}</div>}
-        </div>
-        <div className="flex flex-wrap justify-end gap-2 border-t border-line bg-canvas p-4 md:p-6">
-          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
-          <button className="btn btn-red" onClick={handleCreate}>Create questionnaire</button>
-        </div>
-      </div>
+    <button className={`nav-item ${active ? 'active' : ''}`} onClick={onClick}>
+      <Icon name={icon} className="sm" />
+      {label}
+      {badge ? <span className="nav-badge">{badge}</span> : null}
+    </button>
+  )
+}
+
+function Metric({ label, value, meta }: { label: string; value: number; meta: string }) {
+  return (
+    <div className="metric">
+      <div className="metric-label">{label}</div>
+      <div className="metric-value">{value}</div>
+      <div className="metric-meta">{meta}</div>
     </div>
   )
 }
 
-// --- Question Inspector ---
-
-function QuestionInspector({
-  question,
-  allQuestions,
-  onSave,
-  onDelete,
-}: {
+function QuestionInspector({ question, allQuestions, onSave, onDelete }: {
   question: QuestionData
   allQuestions: QuestionData[]
   onSave: (q: QuestionData) => void
@@ -764,563 +943,537 @@ function QuestionInspector({
 }) {
   const [draft, setDraft] = useState(question)
   const [logicEnabled, setLogicEnabled] = useState(!!question.logic?.showWhen?.conditions?.length)
-
   const questionKey = JSON.stringify(question)
   useEffect(() => {
     setDraft(question)
     setLogicEnabled(!!question.logic?.showWhen?.conditions?.length)
   }, [questionKey])
-
   const others = allQuestions.filter((q) => q.id !== draft.id)
 
   return (
-    <div>
-      <div className="mb-6 flex flex-col gap-4 border-b border-line pb-6 md:mb-8 md:flex-row md:items-start md:justify-between md:gap-6">
-        <div>
-          <div className="kicker mb-2">{draft.id} · {TYPE_LABELS[draft.type]}</div>
-          <h2 className="text-[22px] font-semibold leading-tight tracking-tight md:text-[28px]">Edit question</h2>
-          <p className="text-sm text-muted">Everything for this question is in one place.</p>
-        </div>
-        <button className="btn btn-danger btn-sm" onClick={onDelete}>Delete</button>
-      </div>
-
-      <div className="mb-6">
-        <h3 className="mb-4 text-lg font-semibold">Question</h3>
-        <div className="mb-6">
-          <label className="mb-2 block text-[13px] font-semibold">Question</label>
-          <input className="input" value={draft.question} onChange={(e) => setDraft({ ...draft, question: e.target.value })} />
-        </div>
-        <div className="mb-6">
-          <label className="mb-2 block text-[13px] font-semibold">Help text</label>
-          <textarea className="textarea" value={draft.helpText} onChange={(e) => setDraft({ ...draft, helpText: e.target.value })} />
-        </div>
-      </div>
-
-      <div className="mb-6 border-t border-line pt-6">
-        <h3 className="mb-4 text-lg font-semibold">Answer</h3>
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-          <div>
-            <label className="mb-2 block text-[13px] font-semibold">Response type</label>
-            <select className="v6-select" value={draft.type} onChange={(e) => setDraft({ ...draft, type: e.target.value as QuestionData['type'] })}>
-              {SUPPORTED_TYPES.map((t) => <option key={t} value={t}>{TYPE_LABELS[t]}</option>)}
-            </select>
+    <>
+      <div className="panel-head">
+        <strong>Question settings</strong>
+        <div className="spacer" />
+        <details className="details-menu">
+          <summary className="more-btn" style={{ width: 28, height: 28 }}><Icon name="more" className="xs" /></summary>
+          <div className="menu-pop">
+            <button className="menu-item danger" onClick={onDelete}><Icon name="trash" className="sm" />Delete question</button>
           </div>
-          <div>
-            <label className="mb-2 block text-[13px] font-semibold">Placeholder</label>
-            <input className="input" value={draft.placeholder} onChange={(e) => setDraft({ ...draft, placeholder: e.target.value })} />
-          </div>
+        </details>
+      </div>
+      <div className="prop-section">
+        <div className="prop-section-title">Content</div>
+        <div className="field"><div className="label">Question</div><textarea className="textarea" value={draft.question} onChange={(e) => setDraft({ ...draft, question: e.target.value })} /></div>
+        <div className="field"><div className="label">Help text</div><textarea className="textarea" value={draft.helpText} onChange={(e) => setDraft({ ...draft, helpText: e.target.value })} /></div>
+      </div>
+      <div className="prop-section">
+        <div className="prop-section-title">Answer</div>
+        <div className="field">
+          <div className="label">Response type</div>
+          <select className="select" value={draft.type} onChange={(e) => setDraft({ ...draft, type: e.target.value as QuestionData['type'] })}>
+            {SUPPORTED_TYPES.map((t) => <option key={t} value={t}>{TYPE_LABELS[t]}</option>)}
+          </select>
         </div>
-
         {isChoiceType(draft.type) && (
-          <div className="mt-4">
-            <label className="mb-2 block text-[13px] font-semibold">Options</label>
-            <textarea className="textarea" placeholder="One option per line" value={draft.options.join('\n')} onChange={(e) => setDraft({ ...draft, options: e.target.value.split('\n').map((s) => s.trim()).filter(Boolean) })} />
-            <p className="mt-1 text-xs text-muted">One option per line.</p>
+          <div className="field">
+            <div className="label">Options</div>
+            <textarea className="textarea" value={draft.options.join('\n')} onChange={(e) => setDraft({ ...draft, options: e.target.value.split('\n').map((s) => s.trim()).filter(Boolean) })} />
           </div>
         )}
-
-        <div className="mt-4 flex items-center justify-between border-t border-line py-4">
-          <div><strong className="text-[13px]">Required</strong><p className="text-xs text-muted">Client must answer before continuing.</p></div>
-          <button className={`switch ${draft.required ? 'on' : ''}`} onClick={() => setDraft({ ...draft, required: !draft.required })} />
+        {!isChoiceType(draft.type) && (
+          <div className="field"><div className="label">Placeholder</div><input className="input" value={draft.placeholder} onChange={(e) => setDraft({ ...draft, placeholder: e.target.value })} /></div>
+        )}
+        <div className="switch-row">
+          <div><div className="switch-title">Required</div><div className="switch-sub">Must be answered to continue.</div></div>
+          <button className={`switch ${draft.required ? 'on' : ''}`} onClick={() => setDraft({ ...draft, required: !draft.required })}><span /></button>
         </div>
-        <div className="flex items-center justify-between border-t border-line py-4">
-          <div><strong className="text-[13px]">Active</strong><p className="text-xs text-muted">Keep the question in the draft without deleting it.</p></div>
-          <button className={`switch ${draft.active ? 'on' : ''}`} onClick={() => setDraft({ ...draft, active: !draft.active })} />
+        <div className="switch-row">
+          <div><div className="switch-title">Include in questionnaire</div><div className="switch-sub">Hide without deleting historical data.</div></div>
+          <button className={`switch ${draft.active ? 'on' : ''}`} onClick={() => setDraft({ ...draft, active: !draft.active })}><span /></button>
         </div>
-        <div className="mt-4">
-          <label className="mb-2 block text-[13px] font-semibold">Response field</label>
-          <select
-            className="v6-select"
-            value={draft.role || ''}
-            onChange={(e) => setDraft({ ...draft, role: (e.target.value || null) as QuestionRole | null })}
-          >
+      </div>
+      <div className="prop-section">
+        <div className="prop-section-title">Response mapping</div>
+        <div className="field">
+          <div className="label">Map to field</div>
+          <select className="select" value={draft.role || ''} onChange={(e) => setDraft({ ...draft, role: (e.target.value || null) as QuestionRole | null })}>
             <option value="">Not mapped</option>
             {QUESTION_ROLES.map((role) => <option key={role} value={role}>{ROLE_LABELS[role]}</option>)}
           </select>
-          <p className="mt-1 text-xs text-muted">Map full name, email, company or project type so submissions show the person who sent them.</p>
+          <div className="help">Standard fields keep filtering and exports consistent.</div>
         </div>
       </div>
-
-      <div className="mb-6 border-t border-line pt-6">
-        <h3 className="mb-4 text-lg font-semibold">Rules</h3>
-        <div className="mb-2 text-[13px] font-semibold">Visibility</div>
-        <div className="flex flex-wrap border border-line-strong" style={{ width: 'max-content', maxWidth: '100%' }}>
-          <button className={`border-0 px-4 py-2 text-[13px] ${!logicEnabled ? 'bg-ink text-white' : 'bg-white'}`} onClick={() => { setLogicEnabled(false); setDraft({ ...draft, logic: undefined }) }}>Always show</button>
-          <button className={`border-l border-line-strong px-4 py-2 text-[13px] ${logicEnabled ? 'bg-ink text-white' : 'bg-white'}`} onClick={() => { setLogicEnabled(true); if (!draft.logic) setDraft({ ...draft, logic: { showWhen: { match: 'any', conditions: [{ questionId: others[0]?.id || '', operator: 'equals', value: '' }] } } }) }}>Conditional</button>
+      <div className="prop-section">
+        <div className="prop-section-title">Visibility</div>
+        <div className="switch-row">
+          <div><div className="switch-title">Conditional logic</div><div className="switch-sub">Only show when conditions match.</div></div>
+          <button className={`switch ${logicEnabled ? 'on' : ''}`} onClick={() => {
+            const next = !logicEnabled
+            setLogicEnabled(next)
+            if (!next) setDraft({ ...draft, logic: undefined })
+            else if (!draft.logic) setDraft({ ...draft, logic: { showWhen: { match: 'any', conditions: [{ questionId: others[0]?.id || '', operator: 'equals', value: '' }] } } })
+          }}><span /></button>
         </div>
-
         {logicEnabled && draft.logic && (
-          <div className="mt-4 border-l-[3px] border-red bg-canvas p-4">
-            <div className="mb-4">
-              <label className="mb-2 block text-[13px] font-semibold">Match</label>
-              <select className="v6-select" value={draft.logic.showWhen.match} onChange={(e) => setDraft({ ...draft, logic: { showWhen: { ...draft.logic!.showWhen, match: e.target.value as 'any' | 'all' } } })}>
+          <div className="logic-card">
+            {draft.logic.showWhen.conditions.map((c, i) => (
+              <div key={i} className="field" style={{ display: 'grid', gap: 6 }}>
+                <select className="select" value={c.questionId} onChange={(e) => {
+                  const conds = [...draft.logic!.showWhen.conditions]; conds[i] = { ...conds[i], questionId: e.target.value }
+                  setDraft({ ...draft, logic: { showWhen: { ...draft.logic!.showWhen, conditions: conds } } })
+                }}>{others.map((q) => <option key={q.id} value={q.id}>{q.question}</option>)}</select>
+                <select className="select" value={c.operator} onChange={(e) => {
+                  const conds = [...draft.logic!.showWhen.conditions]; conds[i] = { ...conds[i], operator: e.target.value as ShowOperator }
+                  setDraft({ ...draft, logic: { showWhen: { ...draft.logic!.showWhen, conditions: conds } } })
+                }}>{OPERATORS.map((o) => <option key={o} value={o}>{o.replaceAll('_', ' ')}</option>)}</select>
+                <input className="input" value={c.value || ''} placeholder="Value" onChange={(e) => {
+                  const conds = [...draft.logic!.showWhen.conditions]; conds[i] = { ...conds[i], value: e.target.value }
+                  setDraft({ ...draft, logic: { showWhen: { ...draft.logic!.showWhen, conditions: conds } } })
+                }} />
+              </div>
+            ))}
+            <button className="btn sm ghost" style={{ marginTop: 8 }} onClick={() => setDraft({ ...draft, logic: { showWhen: { ...draft.logic!.showWhen, conditions: [...draft.logic!.showWhen.conditions, { questionId: others[0]?.id || '', operator: 'equals', value: '' }] } } })}>Add condition</button>
+            <div className="field" style={{ marginTop: 10 }}>
+              <div className="label">Match</div>
+              <select className="select" value={draft.logic.showWhen.match} onChange={(e) => setDraft({ ...draft, logic: { showWhen: { ...draft.logic!.showWhen, match: e.target.value as 'any' | 'all' } } })}>
                 <option value="all">All conditions</option>
                 <option value="any">Any condition</option>
               </select>
             </div>
-            {draft.logic.showWhen.conditions.map((c, i) => (
-              <div key={i} className="mb-2 grid grid-cols-1 gap-2 md:grid-cols-[1.2fr_.8fr_1fr_40px]">
-                <select className="v6-select" value={c.questionId} onChange={(e) => {
-                  const conds = [...draft.logic!.showWhen.conditions]
-                  conds[i] = { ...conds[i], questionId: e.target.value }
-                  setDraft({ ...draft, logic: { showWhen: { ...draft.logic!.showWhen, conditions: conds } } })
-                }}>
-                  {others.map((q) => <option key={q.id} value={q.id}>{q.question}</option>)}
-                </select>
-                <select className="v6-select" value={c.operator} onChange={(e) => {
-                  const conds = [...draft.logic!.showWhen.conditions]
-                  conds[i] = { ...conds[i], operator: e.target.value as ShowOperator }
-                  setDraft({ ...draft, logic: { showWhen: { ...draft.logic!.showWhen, conditions: conds } } })
-                }}>
-                  {OPERATORS.map((o) => <option key={o} value={o}>{o.replaceAll('_', ' ')}</option>)}
-                </select>
-                <input className="input" value={c.value || ''} placeholder="Value" onChange={(e) => {
-                  const conds = [...draft.logic!.showWhen.conditions]
-                  conds[i] = { ...conds[i], value: e.target.value }
-                  setDraft({ ...draft, logic: { showWhen: { ...draft.logic!.showWhen, conditions: conds } } })
-                }} />
-                <button className="btn btn-ghost btn-icon" onClick={() => {
-                  const conds = draft.logic!.showWhen.conditions.filter((_, j) => j !== i)
-                  setDraft({ ...draft, logic: conds.length ? { showWhen: { ...draft.logic!.showWhen, conditions: conds } } : undefined })
-                  if (!conds.length) setLogicEnabled(false)
-                }}>×</button>
-              </div>
-            ))}
-            <button className="btn btn-text mt-2" onClick={() => {
-              setDraft({ ...draft, logic: { showWhen: { ...draft.logic!.showWhen, conditions: [...draft.logic!.showWhen.conditions, { questionId: others[0]?.id || '', operator: 'equals', value: '' }] } } })
-            }}>+ Add condition</button>
           </div>
         )}
+        <button className="btn sm primary" style={{ marginTop: 12 }} onClick={() => onSave(draft)}>Save question</button>
       </div>
-
-      <div className="sticky bottom-0 mt-8 flex items-center justify-between border-t border-line bg-white/95 pt-6">
-        <span className="text-xs text-muted">Ready to save</span>
-        <button className="btn btn-red" onClick={() => onSave(draft)}>Save changes</button>
-      </div>
-    </div>
+    </>
   )
 }
 
-// --- Design Tab ---
-
-function DesignTab({ questionnaire, onUpdate }: { questionnaire: QuestionnaireData; onUpdate: (theme: Record<string, unknown>) => void }) {
-  const [theme, setTheme] = useState(questionnaire.theme)
-  useEffect(() => setTheme(questionnaire.theme), [questionnaire.id])
-
-  const themes: [ThemePreset, string, string][] = [
-    ['light', 'Light', 'Clean, direct and universal.'],
-    ['dark', 'Dark', 'Immersive near-black experience.'],
-    ['editorial', 'Editorial', 'Asymmetric and typographic.'],
-  ]
-
-  return (
-    <div className="mt-8 grid grid-cols-1 gap-8 lg:grid-cols-[minmax(0,1fr)_360px]">
-      <div>
-        <h2 className="text-[30px] font-semibold leading-tight tracking-tight">Client appearance</h2>
-        <p className="mb-8 text-sm text-muted">Choose a strong base, then make a few meaningful adjustments.</p>
-        <div className="mb-8 grid grid-cols-1 gap-4 sm:grid-cols-3">
-          {themes.map(([id, name, desc]) => (
-            <button key={id} onClick={() => setTheme({ ...theme, preset: id })} className={`border p-4 text-left ${theme.preset === id ? 'border-ink shadow-[4px_4px_0_rgba(2,2,2,.08)]' : 'border-line-strong'} bg-white`}>
-              <div className={`mb-4 flex h-40 flex-col justify-between border p-4 ${id === 'dark' ? 'border-ink bg-ink text-white' : id === 'editorial' ? 'border-line bg-surface-muted' : 'border-line'}`}>
-                <div className="h-1.5 w-14 bg-red" />
-                <div className="grid gap-2">
-                  <span className="block h-2 w-[86%] opacity-80" style={{ background: 'currentColor' }} />
-                  <span className="block h-1 w-[68%] opacity-20" style={{ background: 'currentColor' }} />
-                  <span className="block h-1 w-[82%] opacity-20" style={{ background: 'currentColor' }} />
-                </div>
-              </div>
-              <strong className="block">{name}</strong>
-              <small className="text-muted">{desc}</small>
-            </button>
-          ))}
-        </div>
-      </div>
-      <aside className="border border-line-strong bg-white p-6">
-        <h3 className="mb-4 text-lg font-semibold">Customize</h3>
-        <div className="mb-6"><label className="mb-2 block text-[13px] font-semibold">Heading scale</label><select className="v6-select" value={theme.heading} onChange={(e) => setTheme({ ...theme, heading: e.target.value as 'large' | 'compact' })}><option value="large">Large</option><option value="compact">Compact</option></select></div>
-        <div className="mb-6"><label className="mb-2 block text-[13px] font-semibold">Content width</label><select className="v6-select" value={theme.width} onChange={(e) => setTheme({ ...theme, width: e.target.value as 'wide' | 'focused' })}><option value="wide">Wide</option><option value="focused">Focused</option></select></div>
-        <div className="mb-6"><label className="mb-2 block text-[13px] font-semibold">Progress style</label><select className="v6-select" value={theme.progress} onChange={(e) => setTheme({ ...theme, progress: e.target.value as 'fraction' | 'minimal' })}><option value="fraction">Question fraction</option><option value="minimal">Minimal label</option></select></div>
-        <div className="flex items-center justify-between py-4">
-          <div><strong className="text-[13px]">Show Appsrow logo</strong><p className="text-xs text-muted">Keep branding visible on client forms.</p></div>
-          <button className={`switch ${theme.showLogo ? 'on' : ''}`} onClick={() => setTheme({ ...theme, showLogo: !theme.showLogo })} />
-        </div>
-        <div className="mt-6 flex gap-2">
-          <button className="btn btn-red" onClick={() => onUpdate(theme)}>Save design</button>
-        </div>
-      </aside>
-    </div>
-  )
-}
-
-// --- Questionnaire Settings ---
-
-function QuestionnaireSettingsTab({ questionnaire, onSave }: {
-  questionnaire: QuestionnaireData
-  onSave: (input: Record<string, unknown>) => void
+function CreateModal({ questionnaires, onClose, onCreate }: {
+  questionnaires: QuestionnaireData[]
+  onClose: () => void
+  onCreate: (input: { name: string; mode: CreateMode; sourceId?: string; isDefault?: boolean }) => void
 }) {
-  const [name, setName] = useState(questionnaire.name)
-  const [slug, setSlug] = useState(questionnaire.slug.replace(/^q\//, ''))
-  const [purpose, setPurpose] = useState(questionnaire.purpose)
-  const [status, setStatus] = useState(questionnaire.status)
-
-  useEffect(() => {
-    setName(questionnaire.name)
-    setSlug(questionnaire.slug.replace(/^q\//, ''))
-    setPurpose(questionnaire.purpose)
-    setStatus(questionnaire.status)
-  }, [questionnaire.id])
+  const [name, setName] = useState('')
+  const [mode, setMode] = useState<CreateMode>('blank')
+  const [sourceId, setSourceId] = useState(questionnaires.find((q) => q.isDefault)?.id || questionnaires[0]?.id || '')
+  const [makeDefault, setMakeDefault] = useState(false)
 
   return (
-    <div className="mt-8 grid grid-cols-1 gap-8 md:grid-cols-[220px_minmax(0,720px)] md:gap-12">
-      <div className="hidden border-t border-ink md:block">
-        <div className="border-b border-line py-4 font-semibold text-red">General</div>
-        <div className="border-b border-line py-4 text-muted">Sharing</div>
-      </div>
-      <div className="border-t border-ink pt-6">
-        <h2 className="text-[24px] font-semibold leading-tight tracking-tight md:text-[30px]">Questionnaire settings</h2>
-        <p className="mb-8 text-sm text-muted">Only the essentials for this questionnaire.</p>
-        <div className="mb-6"><label className="mb-2 block text-[13px] font-semibold">Name</label><input className="input" value={name} onChange={(e) => setName(e.target.value)} /></div>
-        <div className="mb-6"><label className="mb-2 block text-[13px] font-semibold">Slug</label><input className="input mono" value={slug} onChange={(e) => setSlug(e.target.value)} /></div>
-        <div className="mb-6"><label className="mb-2 block text-[13px] font-semibold">Purpose</label><textarea className="textarea" value={purpose} onChange={(e) => setPurpose(e.target.value)} /></div>
-        <div className="mb-6"><label className="mb-2 block text-[13px] font-semibold">Status</label><select className="v6-select" value={status} onChange={(e) => setStatus(e.target.value as 'draft' | 'live')}><option value="draft">Draft</option><option value="live">Live</option></select></div>
-        <div className="mb-8 flex items-center justify-between border border-line-strong bg-white px-4 py-4">
-          <div>
-            <strong className="text-[13px]">Homepage form</strong>
-            <p className="text-xs text-muted">
-              {questionnaire.isDefault
-                ? 'This questionnaire currently opens on the public homepage.'
-                : 'Replace the unavailable page by publishing this form on the homepage.'}
-            </p>
+    <div className="modal" onClick={(e) => { if (e.target === e.currentTarget) onClose() }}>
+      <div className="modal-card">
+        <div className="modal-head"><h3>Create questionnaire</h3><div style={{ marginLeft: 'auto' }}><button className="more-btn" onClick={onClose}>×</button></div></div>
+        <div className="modal-body">
+          <div className="field"><div className="label">Questionnaire name</div><input className="input" autoFocus placeholder="e.g. Website Redesign Discovery" value={name} onChange={(e) => setName(e.target.value)} /></div>
+          <div className="label">Start from</div>
+          <div className="radio-stack">
+            {([
+              ['blank', 'Blank questionnaire', 'Start with an empty structure.'],
+              ['template', 'Use template', 'Start from a reusable Appsrow or workspace template.'],
+              ['duplicate', 'Duplicate existing', 'Copy structure, settings and logic without responses.'],
+              ['import', 'Import JSON / CSV', 'Validate structured data before creating the flow.'],
+            ] as const).map(([value, title, help]) => (
+              <label key={value} className="radio-card">
+                <input type="radio" name="createFrom" checked={mode === value} onChange={() => setMode(value)} />
+                <div><strong>{title}</strong><div className="help">{help}</div></div>
+              </label>
+            ))}
           </div>
-          {questionnaire.isDefault ? (
-            <span className="badge red">Default</span>
-          ) : (
-            <button className="btn btn-ghost btn-sm" onClick={() => onSave({ name, slug: questionnaire.isDefault ? slug : 'q/' + slug, purpose, status: 'live', isDefault: true })}>Set as default</button>
+          {(mode === 'template' || mode === 'duplicate') && (
+            <div className="field" style={{ marginTop: 12 }}>
+              <div className="label">{mode === 'template' ? 'Template' : 'Questionnaire'}</div>
+              <select className="select" value={sourceId} onChange={(e) => setSourceId(e.target.value)}>
+                {questionnaires.filter((q) => q.status !== 'trash').map((q) => <option key={q.id} value={q.id}>{q.name}</option>)}
+              </select>
+            </div>
           )}
+          <div className="switch-row" style={{ marginTop: 12 }}>
+            <div><div className="switch-title">Use as homepage form</div><div className="switch-sub">Publish this questionnaire on the public homepage.</div></div>
+            <button className={`switch ${makeDefault ? 'on' : ''}`} onClick={() => setMakeDefault(!makeDefault)}><span /></button>
+          </div>
         </div>
-        <button className="btn btn-red" onClick={() => onSave({ name, slug: questionnaire.isDefault ? slug : 'q/' + slug, purpose, status })}>Save settings</button>
+        <div className="modal-foot">
+          <button className="btn" onClick={onClose}>Cancel</button>
+          <button className="btn primary" onClick={() => {
+            if (mode !== 'import' && !name.trim()) return
+            onCreate({ name: name.trim() || 'Imported questionnaire', mode, sourceId, isDefault: makeDefault })
+          }}>Create questionnaire</button>
+        </div>
       </div>
     </div>
   )
 }
 
-// --- Response Detail ---
-
-function ResponseDetailPage({ response, questionnaireName, onBack, onToggleStatus, onCopyEmail }: {
-  response: ResponseData; questionnaireName: string; onBack: () => void; onToggleStatus: () => void; onCopyEmail: () => void
+function TemplatesPage({ questionnaires, onUse, onCreate }: {
+  questionnaires: QuestionnaireData[]
+  onUse: (q: QuestionnaireData) => void
+  onCreate: () => void
 }) {
-  return (
-    <div>
-      <div className="mb-6 flex items-center gap-2 text-[13px] text-muted">
-        <button onClick={onBack} className="hover:text-red">Responses</button>
-        <span>/</span><span>{response.name}</span>
-      </div>
-      <div className="flex flex-col gap-4 border-b border-ink pb-6 md:flex-row md:items-end md:justify-between md:gap-8">
-        <div>
-          <div className="kicker mb-2">Submission · {response.submittedAt}</div>
-          <h1 className="text-[28px] font-semibold leading-none tracking-tight md:text-[40px]">{response.name}</h1>
-          <div className="mt-3 flex flex-wrap items-center gap-3 text-[13px] text-muted md:gap-4">
-            <span>{response.company}</span><span>{response.projectType}</span><span>{questionnaireName}</span>
-            <span className={`badge ${response.status === 'new' ? 'red' : ''}`}>{response.status}</span>
-          </div>
-        </div>
-        <div className="flex gap-2">
-          <button className="btn btn-ghost btn-sm" onClick={() => exportResponses([response], 'excel', `response-${response.name || 'entry'}`)}>Excel</button>
-          <button className="btn btn-ghost btn-sm" onClick={() => exportResponses([response], 'json', `response-${response.name || 'entry'}`)}>JSON</button>
-          <button className="btn btn-ghost btn-sm" onClick={() => exportResponses([response], 'md', `response-${response.name || 'entry'}`)}>Markdown</button>
-          <button className="btn btn-ghost btn-sm" onClick={onCopyEmail}>Copy email</button>
-          <button className="btn btn-red btn-sm" onClick={onToggleStatus}>{response.status === 'reviewed' ? 'Mark new' : 'Mark reviewed'}</button>
-        </div>
-      </div>
+  const [search, setSearch] = useState('')
+  const usable = questionnaires.filter((q) => q.status !== 'trash' && q.name.toLowerCase().includes(search.toLowerCase()))
+  const system = usable.filter((q) => q.isDefault)
+  const workspace = usable.filter((q) => !q.isDefault)
 
-      {Object.keys(response.snapshot).length > 0 && (
-        <div className="my-6 grid grid-cols-1 border-l border-t border-line sm:grid-cols-2 md:my-8 lg:grid-cols-4">
-          {Object.entries(response.snapshot).map(([k, v]) => (
-            <div key={k} className="min-h-[100px] border-b border-r border-line p-4">
-              <label className="mono text-[10px] font-semibold uppercase tracking-wider text-muted">{k}</label>
-              <strong className="mt-3 block text-base">{v}</strong>
+  return (
+    <section className="page">
+      <div className="page-head">
+        <div>
+          <div className="eyebrow">Reusable flows</div>
+          <h1>Templates</h1>
+          <p className="page-sub">Use protected Appsrow system templates or create editable workspace templates from proven questionnaires.</p>
+        </div>
+        <div className="head-actions">
+          <button className="btn primary" onClick={onCreate}><Icon name="plus" className="sm" />Create questionnaire</button>
+        </div>
+      </div>
+      <div className="toolbar">
+        <div className="search-box"><Icon name="search" className="sm" /><input placeholder="Search templates" value={search} onChange={(e) => setSearch(e.target.value)} /></div>
+      </div>
+      <div className="template-section">
+        <div className="template-section-head">
+          <div><h2 style={{ fontSize: 18 }}>Appsrow templates</h2><div className="card-sub">Protected system templates. Preview or use them, but they cannot be deleted.</div></div>
+          <span className="standard-pill">Read only</span>
+        </div>
+        <div className="template-grid">
+          {(system.length ? system : usable.slice(0, 1)).map((q) => (
+            <div key={q.id} className="template-card">
+              <div className="template-icon"><Icon name="star" className="sm" /></div>
+              <h3>{q.name}</h3>
+              <div className="template-desc">{q.purpose}</div>
+              <div className="template-meta">
+                <span>{qCount(q.sections)} questions</span>
+                <button className="btn sm" onClick={() => onUse(q)}>Use template</button>
+              </div>
             </div>
           ))}
         </div>
-      )}
-
-      {response.clarity > 0 && (
-        <div className="mb-6 grid grid-cols-1 border border-ink md:mb-8 md:grid-cols-[180px_1fr]">
-          <div className="bg-ink p-6 text-white">
-            <strong className="block text-5xl leading-none">{response.clarity}%</strong>
-            <span className="mono mt-2 block text-[10px] font-semibold uppercase tracking-wider text-[#A8A8A4]">Project clarity</span>
-          </div>
-          <div className="grid grid-cols-1 gap-6 p-6 md:grid-cols-2 md:gap-8">
-            <div>
-              <h3 className="mb-2 text-sm font-semibold">Ready</h3>
-              {response.ready.map((x) => <p key={x} className="my-1 text-[13px] text-muted">✓ {x}</p>)}
-            </div>
-            <div>
-              <h3 className="mb-2 text-sm font-semibold">Clarify on call</h3>
-              {response.clarify.map((x) => <p key={x} className="my-1 text-[13px] text-muted">• {x}</p>)}
-            </div>
-          </div>
-        </div>
-      )}
-
-      <h2 className="mb-4 text-[24px] font-semibold tracking-tight md:text-[30px]">Full responses</h2>
-      <p className="mb-4 text-sm text-muted">Original answers, in questionnaire order.</p>
-      <div className="border-t border-ink">
-        {response.answers.map(([q, a]) => (
-          <div key={q} className="grid grid-cols-1 gap-2 border-b border-line py-4 md:grid-cols-[300px_1fr] md:gap-8 md:py-6">
-            <label className="text-[13px] text-muted">{q}</label>
-            <p className="text-sm">{a}</p>
-          </div>
-        ))}
       </div>
-    </div>
+      <div className="template-section">
+        <div className="template-section-head">
+          <div><h2 style={{ fontSize: 18 }}>Workspace templates</h2><div className="card-sub">Questionnaires you can duplicate into a new draft.</div></div>
+        </div>
+        <div className="template-grid">
+          {workspace.map((q) => (
+            <div key={q.id} className="template-card">
+              <div className="template-icon"><Icon name="template" className="sm" /></div>
+              <h3>{q.name}</h3>
+              <div className="template-desc">{q.purpose}</div>
+              <div className="template-meta">
+                <span>{qCount(q.sections)} questions · {q.status}</span>
+                <button className="btn sm" onClick={() => onUse(q)}>Use template</button>
+              </div>
+            </div>
+          ))}
+          {!workspace.length && <div className="empty-template" style={{ gridColumn: '1 / -1', border: '1px dashed var(--line-strong)', borderRadius: 12, padding: 32, textAlign: 'center' }}>Save a questionnaire from the builder to reuse it here.</div>}
+        </div>
+      </div>
+    </section>
   )
 }
 
-// --- Workspace Settings ---
-
-function WorkspaceSettingsPage({ workspace, onSave }: { workspace: WorkspaceSettings; onSave: (input: WorkspaceSettings) => void }) {
+function SettingsPage({ workspace, section, onSection, onSave, audit, onLogout }: {
+  workspace: WorkspaceSettings
+  section: string
+  onSection: (id: string) => void
+  onSave: (input: WorkspaceSettings) => void
+  audit: { title: string; time: string }[]
+  onLogout: () => void
+}) {
   const [name, setName] = useState(workspace.name)
   const [domain, setDomain] = useState(workspace.domain)
   const [theme, setTheme] = useState(workspace.defaultTheme)
   const [adminEmail, setAdminEmail] = useState(workspace.adminEmail || '')
   const [notifyOnSubmit, setNotifyOnSubmit] = useState(workspace.notifyOnSubmit !== false)
-  const [settingsTab, setSettingsTab] = useState<'workspace' | 'developer'>('workspace')
+  useEffect(() => {
+    setName(workspace.name); setDomain(workspace.domain); setTheme(workspace.defaultTheme)
+    setAdminEmail(workspace.adminEmail || ''); setNotifyOnSubmit(workspace.notifyOnSubmit !== false)
+  }, [workspace])
+
+  const links = [
+    ['general', 'settings', 'General'],
+    ['appearance', 'palette', 'Appearance'],
+    ['notifications', 'bell', 'Notifications'],
+    ['members', 'user', 'Members'],
+    ['retention', 'trash', 'Data retention'],
+    ['security', 'lock', 'Security'],
+    ['audit', 'inbox', 'Audit log'],
+  ] as const
+
+  return (
+    <section className="page">
+      <div className="page-head">
+        <div>
+          <div className="eyebrow">Workspace</div>
+          <h1>Settings</h1>
+          <p className="page-sub">Manage workspace defaults, client appearance, notifications, members, retention and security.</p>
+        </div>
+      </div>
+      <div className="settings-layout">
+        <aside className="settings-nav">
+          <div className="settings-group">
+            {links.slice(0, 3).map(([id, icon, label]) => (
+              <button key={id} className={`settings-link ${section === id ? 'active' : ''}`} onClick={() => onSection(id)}><Icon name={icon} className="sm" />{label}</button>
+            ))}
+          </div>
+          <div className="settings-group">
+            {links.slice(3).map(([id, icon, label]) => (
+              <button key={id} className={`settings-link ${section === id ? 'active' : ''}`} onClick={() => onSection(id)}><Icon name={icon} className="sm" />{label}</button>
+            ))}
+          </div>
+        </aside>
+        <div>
+          {section === 'general' && (
+            <div className="settings-panel">
+              <div className="settings-panel-head"><h3>General</h3><div className="card-sub">Basic workspace details and client-facing domain.</div></div>
+              <div className="settings-panel-body">
+                <div className="form-grid">
+                  <div className="full field"><div className="label">Workspace name</div><input className="input" value={name} onChange={(e) => setName(e.target.value)} /></div>
+                  <div className="full field"><div className="label">Public domain</div><input className="input mono" value={domain} onChange={(e) => setDomain(e.target.value)} /><div className="help">Used when copying public questionnaire links.</div></div>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 8 }}><button className="btn primary" onClick={() => onSave({ name, domain, defaultTheme: theme, adminEmail, notifyOnSubmit })}>Save changes</button></div>
+              </div>
+            </div>
+          )}
+          {section === 'appearance' && (
+            <div className="settings-panel">
+              <div className="settings-panel-head"><h3>Appearance</h3><div className="card-sub">Workspace defaults. Individual questionnaires can override these values.</div></div>
+              <div className="settings-panel-body">
+                <div className="field"><div className="label">Default client theme</div>
+                  <select className="select" value={theme} onChange={(e) => setTheme(e.target.value as ThemePreset)}>
+                    <option value="light">Light</option><option value="dark">Dark</option><option value="editorial">Editorial</option>
+                  </select>
+                </div>
+                <button className="btn primary" onClick={() => onSave({ name, domain, defaultTheme: theme, adminEmail, notifyOnSubmit })}>Save appearance</button>
+              </div>
+            </div>
+          )}
+          {section === 'notifications' && (
+            <div className="settings-panel">
+              <div className="settings-panel-head"><h3>Notifications</h3><div className="card-sub">Notification toggles save immediately.</div></div>
+              <div className="settings-panel-body">
+                <div className="field"><div className="label">Admin notification email</div><input className="input" type="email" placeholder="you@appsrow.com" value={adminEmail} onChange={(e) => setAdminEmail(e.target.value)} /></div>
+                <div className="switch-row">
+                  <div><div className="switch-title">Email on new entry</div><div className="switch-sub">Requires RESEND_API_KEY in .env.local.</div></div>
+                  <button className={`switch ${notifyOnSubmit ? 'on' : ''}`} onClick={() => setNotifyOnSubmit(!notifyOnSubmit)}><span /></button>
+                </div>
+                <button className="btn primary" onClick={() => onSave({ name, domain, defaultTheme: theme, adminEmail, notifyOnSubmit })}>Save notifications</button>
+              </div>
+            </div>
+          )}
+          {section === 'members' && (
+            <div className="settings-panel">
+              <div className="settings-panel-head"><h3>Members</h3><div className="card-sub">This workspace uses a shared admin password, not individual logins.</div></div>
+              <div className="settings-panel-body">
+                <div className="activity-row">
+                  <div className="person-avatar">AD</div>
+                  <div className="activity-body"><div className="activity-title">Admin</div><div className="activity-meta">Shared password access</div></div>
+                  <span className="status live">Active</span>
+                </div>
+              </div>
+            </div>
+          )}
+          {section === 'retention' && (
+            <div className="settings-panel">
+              <div className="settings-panel-head"><h3>Data retention</h3><div className="card-sub">Trash stays recoverable until you delete it permanently from the Questionnaires or Responses pages.</div></div>
+              <div className="settings-panel-body"><p className="help">Move items to trash first, then delete permanently if you are sure.</p></div>
+            </div>
+          )}
+          {section === 'security' && (
+            <div className="settings-panel danger-zone">
+              <div className="settings-panel-head"><h3>Security & change protection</h3><div className="card-sub">High-impact actions require confirmation. Lock the workspace when you leave.</div></div>
+              <div className="settings-panel-body"><button className="btn danger" onClick={onLogout}><Icon name="lock" className="sm" />Lock workspace</button></div>
+            </div>
+          )}
+          {section === 'audit' && (
+            <div className="settings-panel">
+              <div className="settings-panel-head"><h3>Audit log</h3><div className="card-sub">Important workspace actions from this session.</div></div>
+              <div className="settings-panel-body">
+                {audit.length ? audit.map((item, i) => (
+                  <div key={i} className="audit-row">
+                    <div className="audit-icon"><Icon name="inbox" className="xs" /></div>
+                    <div><div className="audit-title">{item.title}</div><div className="audit-meta">{item.time}</div></div>
+                  </div>
+                )) : <p className="help">Actions you take in this session will appear here.</p>}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </section>
+  )
+}
+
+function DeveloperPage({ onImported, onStatus }: {
+  onImported: (q: QuestionnaireData) => void
+  onStatus: (msg: string) => void
+}) {
   const [jsonInput, setJsonInput] = useState('')
-  const [jsonStatus, setJsonStatus] = useState('')
-  const [csvStatus, setCsvStatus] = useState('')
+  const [step, setStep] = useState(1)
   const [csvDragging, setCsvDragging] = useState(false)
 
+  async function importPayload(payload: unknown) {
+    const res = await fetch('/api/adl/questionnaires', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+    })
+    const data = await res.json() as { questionnaire?: QuestionnaireData; error?: string }
+    if (!res.ok || !data.questionnaire) { onStatus(data.error || 'Import failed.'); return }
+    setStep(3)
+    onImported(data.questionnaire)
+  }
+
   async function handleJsonImport() {
-    if (!jsonInput.trim()) { setJsonStatus('Paste a JSON payload first.'); return }
+    if (!jsonInput.trim()) { onStatus('Paste a JSON payload first.'); return }
     try {
-      const parsed = JSON.parse(jsonInput)
-      if (!parsed || typeof parsed !== 'object') { setJsonStatus('Invalid JSON object.'); return }
-      const res = await fetch('/api/adl/questionnaires', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(parsed),
-      })
-      const data = await res.json() as { questionnaire?: { id: string; name: string }; error?: string }
-      if (!res.ok) { setJsonStatus(data.error || 'Import failed.'); return }
-      const qName = data.questionnaire?.name || 'Questionnaire'
-      setJsonStatus(`Successfully imported "${qName}".`)
+      setStep(2)
+      await importPayload(JSON.parse(jsonInput))
       setJsonInput('')
-    } catch {
-      setJsonStatus('Invalid JSON — check syntax and try again.')
-    }
-  }
-
-  function handleJsonFile(file: File) {
-    const reader = new FileReader()
-    reader.onload = (e) => {
-      setJsonInput(e.target?.result as string || '')
-      setJsonStatus('')
-    }
-    reader.readAsText(file)
-  }
-
-  function parseCsvToJson(csvText: string): { questionnaire: Record<string, string>; sections: Record<string, unknown>[]; questions: Record<string, unknown>[] } | null {
-    const lines = csvText.trim().split('\n').map((l) => l.split(',').map((c) => c.trim().replace(/^"|"$/g, '')))
-    if (lines.length < 2) return null
-    const headers = lines[0].map((h) => h.toLowerCase().replace(/\s+/g, '_'))
-    const sectionIdx = headers.indexOf('section')
-    const questionIdx = headers.indexOf('question')
-    const typeIdx = headers.indexOf('type')
-    const requiredIdx = headers.indexOf('required')
-    const optionsIdx = headers.indexOf('options')
-    const helpIdx = headers.indexOf('help_text')
-    const placeholderIdx = headers.indexOf('placeholder')
-
-    if (questionIdx < 0) return null
-
-    const sectionMap: Record<string, { id: string; title: string; order: number }> = {}
-    const questions: Record<string, unknown>[] = []
-    let sectionOrder = 0
-    let questionOrder = 0
-
-    for (let i = 1; i < lines.length; i++) {
-      const row = lines[i]
-      if (!row[questionIdx]?.trim()) continue
-      const secTitle = sectionIdx >= 0 && row[sectionIdx] ? row[sectionIdx] : 'General'
-      const secKey = secTitle.toLowerCase()
-      if (!sectionMap[secKey]) {
-        sectionOrder++
-        sectionMap[secKey] = { id: `csv_sec_${sectionOrder}`, title: secTitle, order: sectionOrder }
-      }
-      questionOrder++
-      const opts = optionsIdx >= 0 && row[optionsIdx] ? row[optionsIdx].split('|').map((s) => s.trim()).filter(Boolean) : []
-      const rawType = typeIdx >= 0 && row[typeIdx] ? row[typeIdx].toLowerCase().replace(/\s+/g, '_') : 'short_text'
-      questions.push({
-        id: `csv_q_${questionOrder}`,
-        sectionId: sectionMap[secKey].id,
-        type: rawType,
-        question: row[questionIdx],
-        helpText: helpIdx >= 0 ? row[helpIdx] || '' : '',
-        placeholder: placeholderIdx >= 0 ? row[placeholderIdx] || '' : '',
-        required: requiredIdx >= 0 ? row[requiredIdx]?.toLowerCase() === 'true' || row[requiredIdx] === '1' : false,
-        active: true,
-        order: questionOrder,
-        options: opts,
-      })
-    }
-
-    return {
-      questionnaire: { name: 'Imported from CSV', slug: `csv-import-${Date.now().toString(36)}`, purpose: 'Imported from spreadsheet.' },
-      sections: Object.values(sectionMap),
-      questions,
-    }
-  }
-
-  async function handleCsvImport(file: File) {
-    setCsvStatus('')
-    const text = await file.text()
-    const payload = parseCsvToJson(text)
-    if (!payload || payload.questions.length === 0) {
-      setCsvStatus('Could not parse the file. Ensure it has at least a "question" column header.')
-      return
-    }
-    try {
-      const res = await fetch('/api/adl/questionnaires', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      })
-      const data = await res.json() as { questionnaire?: { id: string; name: string }; error?: string }
-      if (!res.ok) { setCsvStatus(data.error || 'Import failed.'); return }
-      setCsvStatus(`Successfully imported ${payload.questions.length} questions into "${data.questionnaire?.name}".`)
-    } catch {
-      setCsvStatus('Import failed — check your file and try again.')
-    }
+    } catch { onStatus('Invalid JSON — check syntax and try again.') }
   }
 
   return (
-    <div>
-      <div className="mb-8 md:mb-12">
-        <div className="kicker">Workspace</div>
-        <h1 className="mt-2 text-[clamp(32px,4.6vw,56px)] font-semibold leading-none tracking-[-0.045em]">Settings</h1>
-        <p className="mt-4 max-w-[760px] text-base leading-relaxed text-muted">Workspace defaults and technical import tools, kept separate from day-to-day questionnaire editing.</p>
-      </div>
-      <div className="grid grid-cols-1 gap-8 md:grid-cols-[220px_minmax(0,720px)] md:gap-12">
-        <div className="flex overflow-auto border-b border-line md:block md:border-b-0 md:border-t md:border-ink">
-          <button onClick={() => setSettingsTab('workspace')} className={`shrink-0 border-b border-line px-3 py-4 text-left md:block md:w-full md:px-0 ${settingsTab === 'workspace' ? 'font-semibold text-red' : 'text-muted'}`}>Workspace</button>
-          <button onClick={() => setSettingsTab('developer')} className={`shrink-0 border-b border-line px-3 py-4 text-left md:block md:w-full md:px-0 ${settingsTab === 'developer' ? 'font-semibold text-red' : 'text-muted'}`}>Developer & JSON</button>
+    <section className="page">
+      <div className="page-head">
+        <div>
+          <div className="eyebrow">Developer</div>
+          <h1>Developer & data</h1>
+          <p className="page-sub">Import structured questionnaires, validate files, and inspect the admin API.</p>
         </div>
-
-        {settingsTab === 'workspace' && (
-          <div className="border-t border-ink pt-6">
-            <h2 className="text-[24px] font-semibold leading-tight tracking-tight md:text-[30px]">Workspace</h2>
-            <p className="mb-8 text-sm text-muted">Defaults that apply across Appsrow Discovery.</p>
-            <div className="mb-6"><label className="mb-2 block text-[13px] font-semibold">Workspace name</label><input className="input" value={name} onChange={(e) => setName(e.target.value)} /></div>
-            <div className="mb-6"><label className="mb-2 block text-[13px] font-semibold">Public domain</label><input className="input mono" value={domain} onChange={(e) => setDomain(e.target.value)} /></div>
-            <div className="mb-6"><label className="mb-2 block text-[13px] font-semibold">Default client theme</label><select className="v6-select" value={theme} onChange={(e) => setTheme(e.target.value as ThemePreset)}><option value="light">Light</option><option value="dark">Dark</option><option value="editorial">Editorial</option></select></div>
-            <div className="mb-6"><label className="mb-2 block text-[13px] font-semibold">Admin notification email</label><input className="input" type="email" placeholder="you@appsrow.com" value={adminEmail} onChange={(e) => setAdminEmail(e.target.value)} /><p className="mt-1 text-xs text-muted">This is the inbox that should get the alert. The toggle below does not send mail by itself.</p></div>
-            <div className="mb-8 flex items-center justify-between border-t border-line py-4">
-              <div>
-                <strong className="text-[13px]">Email on new entry</strong>
-                <p className="text-xs text-muted">Turns the feature on. Mail still needs a Resend API key in `.env.local` (`RESEND_API_KEY`). Without that key, new responses save but no email is sent.</p>
-              </div>
-              <button className={`switch ${notifyOnSubmit ? 'on' : ''}`} onClick={() => setNotifyOnSubmit(!notifyOnSubmit)} />
-            </div>
-            <button className="btn btn-red" onClick={() => onSave({ name, domain, defaultTheme: theme, adminEmail, notifyOnSubmit })}>Save workspace</button>
-          </div>
-        )}
-
-        {settingsTab === 'developer' && (
-          <div className="border-t border-ink pt-6">
-            <h2 className="text-[24px] font-semibold leading-tight tracking-tight md:text-[30px]">Developer & JSON</h2>
-            <p className="mb-8 text-sm text-muted">Import questionnaires from JSON or spreadsheets, or use the API for programmatic access.</p>
-
-            {/* JSON Import */}
-            <div className="mb-10">
-              <h3 className="mb-2 text-lg font-semibold">Import from JSON</h3>
-              <p className="mb-4 text-[13px] text-muted">
-                Paste the full Appsrow JSON format with <code className="mono text-ink">questionnaire</code>, <code className="mono text-ink">sections</code>, and <code className="mono text-ink">questions</code> arrays — including conditional logic, options, and roles.
-                Or upload a <code className="mono text-ink">.json</code> file.
-              </p>
-              <textarea
-                className="textarea mono"
-                style={{ minHeight: 220, fontSize: 12 }}
-                placeholder={'{\n  "questionnaire": { "name": "...", "slug": "...", "purpose": "..." },\n  "sections": [ { "id": "about", "title": "About you", "order": 1 } ],\n  "questions": [\n    { "id": "q1", "sectionId": "about", "type": "email", "question": "Your email?", ... }\n  ]\n}'}
-                value={jsonInput}
-                onChange={(e) => { setJsonInput(e.target.value); setJsonStatus('') }}
-              />
-              {jsonStatus && (
-                <div className={`mt-2 border-l-[3px] p-3 text-sm ${jsonStatus.includes('Successfully') ? 'border-green-600 bg-green-50 text-green-800' : 'border-red bg-[#FFF7F7] text-red'}`}>
-                  {jsonStatus}
-                </div>
-              )}
-              <div className="mt-4 flex flex-wrap items-center gap-2">
-                <button className="btn btn-red" onClick={handleJsonImport}>Import JSON</button>
-                <label className="btn btn-ghost cursor-pointer">
-                  Upload .json file
-                  <input type="file" accept=".json,application/json" className="hidden" onChange={(e) => { if (e.target.files?.[0]) handleJsonFile(e.target.files[0]) }} />
-                </label>
-                <button className="btn btn-ghost" onClick={() => { setJsonInput(''); setJsonStatus('') }}>Clear</button>
-              </div>
-            </div>
-
-            {/* CSV / Sheet Upload */}
-            <div className="mb-10 border-t border-line pt-8">
-              <h3 className="mb-2 text-lg font-semibold">Import from spreadsheet</h3>
-              <p className="mb-4 text-[13px] text-muted">
-                Upload a <code className="mono text-ink">.csv</code> file. Required column: <code className="mono text-ink">question</code>.
-                Optional columns: <code className="mono text-ink">section</code>, <code className="mono text-ink">type</code>, <code className="mono text-ink">required</code>, <code className="mono text-ink">options</code> (pipe-separated), <code className="mono text-ink">help_text</code>, <code className="mono text-ink">placeholder</code>.
-              </p>
-              <div
-                className={`flex min-h-[160px] flex-col items-center justify-center gap-3 border-2 border-dashed p-8 text-center transition ${csvDragging ? 'border-red bg-[#FFF7F7]' : 'border-line-strong bg-canvas'}`}
-                onDragOver={(e) => { e.preventDefault(); setCsvDragging(true) }}
-                onDragLeave={() => setCsvDragging(false)}
-                onDrop={(e) => { e.preventDefault(); setCsvDragging(false); const f = e.dataTransfer.files[0]; if (f) handleCsvImport(f) }}
-              >
-                <div className="text-3xl">📄</div>
-                <p className="text-sm text-muted">Drag and drop a .csv file here</p>
-                <label className="btn btn-ghost btn-sm cursor-pointer">
-                  Or choose file
-                  <input type="file" accept=".csv,text/csv" className="hidden" onChange={(e) => { if (e.target.files?.[0]) handleCsvImport(e.target.files[0]) }} />
-                </label>
-              </div>
-              {csvStatus && (
-                <div className={`mt-2 border-l-[3px] p-3 text-sm ${csvStatus.includes('Successfully') ? 'border-green-600 bg-green-50 text-green-800' : 'border-red bg-[#FFF7F7] text-red'}`}>
-                  {csvStatus}
-                </div>
-              )}
-              <div className="mt-4 border border-line bg-white p-4">
-                <div className="mb-2 text-[13px] font-semibold">Example CSV format</div>
-                <pre className="mono overflow-auto text-[11px] text-muted">section,question,type,required,options,help_text,placeholder{'\n'}About you,What is your email?,email,true,,,you@company.com{'\n'}About you,Your full name?,short_text,true,,,Your name{'\n'}Project,What do you need?,single_select,true,Design|Development|Both,,{'\n'}Project,Describe the goal,long_text,false,,,Tell us more...</pre>
-              </div>
-            </div>
-
-            {/* API Reference */}
-            <div className="border-t border-line pt-8">
-              <h3 className="mb-4 text-lg font-semibold">API endpoints</h3>
-              <div className="grid gap-4">
-                {[
-                  ['GET', '/api/adl/questionnaires', 'List all questionnaires'],
-                  ['POST', '/api/adl/questionnaires', 'Create a questionnaire (JSON import, blank, or universal clone)'],
-                  ['GET', '/api/adl/questionnaires/:id', 'Get a single questionnaire with sections and questions'],
-                  ['PUT', '/api/adl/questionnaires/:id', 'Update questionnaire settings, theme, or status'],
-                  ['DELETE', '/api/adl/questionnaires/:id', 'Delete a non-default questionnaire'],
-                  ['POST', '/api/adl/questionnaires/:id/sections', 'Add a section'],
-                  ['POST', '/api/adl/questionnaires/:id/questions', 'Add a question to a section'],
-                  ['PUT', '/api/adl/questions/:id', 'Update a question'],
-                  ['DELETE', '/api/adl/questions/:id', 'Delete a question'],
-                  ['GET', '/api/adl/workspace', 'Get workspace settings'],
-                  ['PUT', '/api/adl/workspace', 'Update workspace settings'],
-                ].map(([method, path, desc]) => (
-                  <div key={path + method} className="flex items-start gap-3 border-b border-line pb-3">
-                    <span className={`mono shrink-0 text-[11px] font-semibold ${method === 'GET' ? 'text-blue-600' : method === 'POST' ? 'text-green-600' : method === 'PUT' ? 'text-amber-600' : 'text-red'}`}>{method}</span>
-                    <div>
-                      <code className="mono text-[13px] text-ink">{path}</code>
-                      <p className="mt-0.5 text-[12px] text-muted">{desc}</p>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-        )}
       </div>
-    </div>
+      <div className="developer-grid">
+        <div className="card">
+          <div className="card-head"><div><h3>Import questionnaire</h3><div className="card-sub">Upload → Validate → Review & import.</div></div><span className="status draft">Step {step} of 3</span></div>
+          <div style={{ padding: 16 }}>
+            <div className="import-steps">
+              <div className={`import-step ${step >= 1 ? 'active' : ''}`}>1. Upload</div>
+              <div className={`import-step ${step >= 2 ? 'active' : ''}`}>2. Validate</div>
+              <div className={`import-step ${step >= 3 ? 'active' : ''}`}>3. Review & import</div>
+            </div>
+            <textarea className="textarea mono" style={{ minHeight: 140, fontSize: 12 }} placeholder={'{\n  "questionnaire": { "name": "...", "slug": "..." },\n  "sections": [],\n  "questions": []\n}'} value={jsonInput} onChange={(e) => setJsonInput(e.target.value)} />
+            <div
+              className="dropzone"
+              style={{ marginTop: 12, minHeight: 120 }}
+              onDragOver={(e) => { e.preventDefault(); setCsvDragging(true) }}
+              onDragLeave={() => setCsvDragging(false)}
+              onDrop={(e) => { e.preventDefault(); setCsvDragging(false); const f = e.dataTransfer.files[0]; if (f) void importFile(f, importPayload, onStatus, setStep) }}
+            >
+              <div>
+                <Icon name="upload" />
+                <h3>{csvDragging ? 'Drop to import' : 'Drop JSON or CSV here'}</h3>
+                <label className="btn sm" style={{ marginTop: 14 }}>
+                  Choose file
+                  <input type="file" accept=".json,.csv,application/json,text/csv" className="hidden" onChange={(e) => { if (e.target.files?.[0]) void importFile(e.target.files[0], importPayload, onStatus, setStep) }} />
+                </label>
+              </div>
+            </div>
+            <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+              <button className="btn primary" onClick={() => void handleJsonImport()}>Import JSON</button>
+            </div>
+          </div>
+        </div>
+        <div className="card">
+          <div className="card-head"><div><h3>JSON structure</h3><div className="card-sub">Expected questionnaire schema.</div></div></div>
+          <div style={{ padding: 16 }}>
+            <pre className="codebox">{`{
+  "questionnaire": {
+    "name": "Website Discovery",
+    "slug": "website-discovery"
+  },
+  "sections": [
+    { "id": "start", "title": "Start here" }
+  ],
+  "questions": [
+    {
+      "id": "q1",
+      "sectionId": "start",
+      "type": "single_select",
+      "required": true
+    }
+  ]
+}`}</pre>
+          </div>
+        </div>
+      </div>
+      <div className="card" style={{ marginTop: 16 }}>
+        <div className="card-head"><div><h3>API endpoints</h3><div className="card-sub">Session-authenticated admin API. Scoped API keys are not enabled.</div></div></div>
+        <div style={{ padding: '4px 18px 8px' }}>
+          {[
+            ['GET', '/api/adl/questionnaires', 'List questionnaires'],
+            ['POST', '/api/adl/questionnaires', 'Create, duplicate, or import'],
+            ['PUT', '/api/adl/questionnaires/:id', 'Update status, theme, homepage'],
+            ['DELETE', '/api/adl/questionnaires/:id', 'Permanently delete'],
+            ['PUT', '/api/adl/responses/:id', 'Status or internal note'],
+            ['DELETE', '/api/adl/responses/:id', 'Permanently delete a response'],
+          ].map(([method, path, desc]) => (
+            <div key={method + path} className="api-row">
+              <div className={`method ${method.toLowerCase()}`}>{method}</div>
+              <div><div className="endpoint">{path}</div><div className="api-desc">{desc}</div></div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </section>
   )
+}
+
+async function importFile(
+  file: File,
+  importPayload: (payload: unknown) => Promise<void>,
+  onStatus: (msg: string) => void,
+  setStep: (n: number) => void,
+) {
+  const text = await file.text()
+  setStep(2)
+  if (file.name.endsWith('.json') || file.type.includes('json')) {
+    try { await importPayload(JSON.parse(text)) } catch { onStatus('Invalid JSON file.') }
+    return
+  }
+  const payload = parseCsvToJson(text)
+  if (!payload) { onStatus('Could not parse the CSV. Include a "question" column.'); return }
+  await importPayload(payload)
+}
+
+function parseCsvToJson(csvText: string) {
+  const lines = csvText.trim().split('\n').map((l) => l.split(',').map((c) => c.trim().replace(/^"|"$/g, '')))
+  if (lines.length < 2) return null
+  const headers = lines[0].map((h) => h.toLowerCase().replace(/\s+/g, '_'))
+  const sectionIdx = headers.indexOf('section')
+  const questionIdx = headers.indexOf('question')
+  const typeIdx = headers.indexOf('type')
+  const requiredIdx = headers.indexOf('required')
+  const optionsIdx = headers.indexOf('options')
+  const helpIdx = headers.indexOf('help_text')
+  const placeholderIdx = headers.indexOf('placeholder')
+  if (questionIdx < 0) return null
+  const sectionMap: Record<string, { id: string; title: string; order: number }> = {}
+  const questions: Record<string, unknown>[] = []
+  let sectionOrder = 0
+  let questionOrder = 0
+  for (let i = 1; i < lines.length; i++) {
+    const row = lines[i]
+    if (!row[questionIdx]?.trim()) continue
+    const secTitle = sectionIdx >= 0 && row[sectionIdx] ? row[sectionIdx] : 'General'
+    const secKey = secTitle.toLowerCase()
+    if (!sectionMap[secKey]) {
+      sectionOrder++
+      sectionMap[secKey] = { id: `csv_sec_${sectionOrder}`, title: secTitle, order: sectionOrder }
+    }
+    questionOrder++
+    questions.push({
+      id: `csv_q_${questionOrder}`,
+      sectionId: sectionMap[secKey].id,
+      type: typeIdx >= 0 && row[typeIdx] ? row[typeIdx].toLowerCase().replace(/\s+/g, '_') : 'short_text',
+      question: row[questionIdx],
+      helpText: helpIdx >= 0 ? row[helpIdx] || '' : '',
+      placeholder: placeholderIdx >= 0 ? row[placeholderIdx] || '' : '',
+      required: requiredIdx >= 0 ? row[requiredIdx]?.toLowerCase() === 'true' || row[requiredIdx] === '1' : false,
+      active: true,
+      order: questionOrder,
+      options: optionsIdx >= 0 && row[optionsIdx] ? row[optionsIdx].split('|').map((s) => s.trim()).filter(Boolean) : [],
+    })
+  }
+  return {
+    questionnaire: { name: 'Imported from CSV', slug: `csv-import-${Date.now().toString(36)}`, purpose: 'Imported from spreadsheet.' },
+    sections: Object.values(sectionMap),
+    questions,
+  }
 }

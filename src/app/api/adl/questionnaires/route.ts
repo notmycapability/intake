@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server'
 import { listQuestionnaires, createQuestionnaire, ensureSeeded } from '@/lib/db'
 import { isAllowedOrigin, readJsonBody } from '@/lib/requestGuard'
 import type { SectionData } from '@/lib/questions'
-import { uid, isValidSlug } from '@/lib/questions'
+import { uid, isValidSlug, uniqueSlug, cloneQuestionnaireSections } from '@/lib/questions'
 
 export async function GET() {
   try {
@@ -27,21 +27,28 @@ export async function POST(request: Request) {
     const data = body.value as Record<string, unknown>
     const nested = data.questionnaire as Record<string, unknown> | undefined
     const name = (typeof data.name === 'string' ? data.name.trim() : '') || (nested && typeof nested.name === 'string' ? nested.name.trim() : '')
-    const slug = (typeof data.slug === 'string' ? data.slug.trim() : '') || (nested && typeof nested.slug === 'string' ? nested.slug.trim() : '')
+    const rawSlug = (typeof data.slug === 'string' ? data.slug.trim() : '') || (nested && typeof nested.slug === 'string' ? nested.slug.trim() : '')
     const purpose = (typeof data.purpose === 'string' ? data.purpose.trim() : '') || (nested && typeof nested.purpose === 'string' ? nested.purpose.trim() : '')
 
     if (!name) return NextResponse.json({ error: 'Name is required.' }, { status: 400 })
-    if (!isValidSlug(slug)) return NextResponse.json({ error: 'Use a valid slug.' }, { status: 400 })
 
     const existing = await listQuestionnaires()
+    const taken = existing.map((q) => q.slug)
+    const requestedSlug = rawSlug.replace(/^q\//, '')
+    const slug = requestedSlug
+      ? requestedSlug
+      : uniqueSlug(name, taken)
+
+    if (!isValidSlug(slug)) return NextResponse.json({ error: 'Use a valid slug.' }, { status: 400 })
     if (existing.some((q) => q.slug === slug || q.slug === 'q/' + slug)) {
       return NextResponse.json({ error: 'That slug is already in use.' }, { status: 400 })
     }
 
     let sections: SectionData[] = []
-    const mode = typeof data.mode === 'string' ? data.mode : 'universal'
+    const mode = typeof data.mode === 'string' ? data.mode : 'blank'
+    const sourceId = typeof data.sourceId === 'string' ? data.sourceId : ''
+    const templateId = typeof data.templateId === 'string' ? data.templateId : ''
 
-    // Full JSON import: { questionnaire: {...}, sections: [...], questions: [...] }
     const jsonQ = data.questionnaire as Record<string, unknown> | undefined
     const jsonSections = Array.isArray(data.sections) ? data.sections : null
     const jsonQuestions = Array.isArray(data.questions) ? data.questions : null
@@ -77,34 +84,13 @@ export async function POST(request: Request) {
         })
       }
       sections = Object.values(sectionMap).sort((a, b) => a.order - b.order)
-    } else if (mode === 'universal') {
-      const universal = existing.find((q) => q.isDefault)
-      if (universal) {
-        const idMap: Record<string, string> = {}
-        sections = universal.sections.map((s, si) => {
-          const newSid = uid('section')
-          return {
-            ...s,
-            id: newSid,
-            order: si + 1,
-            questions: s.questions.map((q, qi) => {
-              const newQid = uid('q')
-              idMap[q.id] = newQid
-              return { ...q, id: newQid, sectionId: newSid, order: qi + 1 }
-            }),
-          }
-        })
-        for (const s of sections) {
-          for (const q of s.questions) {
-            if (q.logic?.showWhen?.conditions) {
-              q.logic.showWhen.conditions = q.logic.showWhen.conditions.map((c) => ({
-                ...c,
-                questionId: idMap[c.questionId] || c.questionId,
-              }))
-            }
-          }
-        }
-      }
+    } else {
+      const source =
+        mode === 'duplicate' ? existing.find((q) => q.id === sourceId) :
+        mode === 'template' ? existing.find((q) => q.id === templateId) || existing.find((q) => q.isDefault) :
+        mode === 'universal' ? existing.find((q) => q.isDefault) || existing[0] :
+        null
+      if (source) sections = cloneQuestionnaireSections(source.sections)
     }
 
     if (sections.length === 0 && (mode === 'blank' || !jsonSections)) {
@@ -114,12 +100,13 @@ export async function POST(request: Request) {
     const questionnaire = await createQuestionnaire({
       name,
       slug: 'q/' + slug,
-      purpose: purpose || 'Imported questionnaire.',
+      purpose: purpose || (mode === 'duplicate' ? 'Duplicated questionnaire.' : 'Discovery questionnaire.'),
       status: data.isDefault === true ? 'live' : 'draft',
       isDefault: data.isDefault === true,
       theme: typeof data.theme === 'object' && data.theme ? data.theme as Partial<Record<string, unknown>> :
         typeof data.theme === 'string' ? { preset: data.theme } :
         nested && typeof nested.theme === 'string' ? { preset: nested.theme } :
+        jsonQ && typeof jsonQ.theme === 'string' ? { preset: jsonQ.theme } :
         undefined,
       sections,
     })

@@ -78,7 +78,7 @@ export type ThemeSettings = {
   showLogo: boolean
 }
 
-export type QuestionnaireStatus = 'draft' | 'live'
+export type QuestionnaireStatus = 'draft' | 'live' | 'closed' | 'archived' | 'trash'
 
 export type QuestionnaireData = {
   id: string
@@ -100,7 +100,7 @@ export type ResponseData = {
   name: string
   company: string
   email: string
-  status: 'new' | 'reviewed' | 'incomplete'
+  status: 'new' | 'reviewed' | 'incomplete' | 'archived' | 'trash'
   clarity: number
   submittedAt: string
   createdAt: string
@@ -109,6 +109,14 @@ export type ResponseData = {
   ready: string[]
   clarify: string[]
   answers: [string, string][]
+  notes: ResponseNote[]
+}
+
+export type ResponseNote = {
+  id: string
+  author: string
+  time: string
+  body: string
 }
 
 export type WorkspaceSettings = {
@@ -166,6 +174,50 @@ export function slugify(value: string): string {
 
 export function isValidSlug(value: string): boolean {
   return /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(value)
+}
+
+export function uniqueSlug(desired: string, taken: string[]): string {
+  const base = slugify(desired) || 'questionnaire'
+  const used = new Set(taken.map((value) => value.replace(/^q\//, '')))
+  if (!used.has(base)) return base
+  let n = 2
+  while (used.has(`${base}-${n}`)) n += 1
+  return `${base}-${n}`
+}
+
+export function cloneQuestionnaireSections(source: SectionData[]): SectionData[] {
+  const idMap: Record<string, string> = {}
+  const sections = source.map((section, sectionIndex) => {
+    const newSid = uid('section')
+    return {
+      ...section,
+      id: newSid,
+      order: sectionIndex + 1,
+      questions: section.questions.map((question, questionIndex) => {
+        const newQid = uid('q')
+        idMap[question.id] = newQid
+        return { ...question, id: newQid, sectionId: newSid, order: questionIndex + 1 }
+      }),
+    }
+  })
+  return sections.map((section) => ({
+    ...section,
+    questions: section.questions.map((question) => {
+      if (!question.logic?.showWhen?.conditions) return question
+      return {
+        ...question,
+        logic: {
+          showWhen: {
+            ...question.logic.showWhen,
+            conditions: question.logic.showWhen.conditions.map((condition) => ({
+              ...condition,
+              questionId: idMap[condition.questionId] || condition.questionId,
+            })),
+          },
+        },
+      }
+    }),
+  }))
 }
 
 export function getString(answers: Answers, id: string): string {

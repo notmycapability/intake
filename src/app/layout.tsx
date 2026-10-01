@@ -1,5 +1,6 @@
 import type { Metadata } from 'next'
 import './globals.css'
+import './v4.css'
 
 export const metadata: Metadata = {
   title: 'Appsrow Discovery',

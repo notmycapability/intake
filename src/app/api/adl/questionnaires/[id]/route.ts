@@ -36,7 +36,9 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
     const { id } = await params
     const q = await getQuestionnaire(id)
     if (!q) return NextResponse.json({ error: 'Not found.' }, { status: 404 })
-    if (q.isDefault) return NextResponse.json({ error: 'Cannot delete default questionnaire.' }, { status: 400 })
+    if (q.isDefault && q.status !== 'trash') {
+      return NextResponse.json({ error: 'Move the homepage form to trash before deleting it.' }, { status: 400 })
+    }
     await deleteQuestionnaire(id)
     return NextResponse.json({ ok: true })
   } catch (error) {

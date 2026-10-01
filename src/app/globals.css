@@ -50,7 +50,7 @@
   @apply inline-flex items-center justify-center gap-2 whitespace-nowrap font-semibold text-sm;
   appearance: none;
   border: 1px solid #020202;
-  border-radius: 0;
+  border-radius: 8px;
   background: #fff;
   color: #020202;
   height: 48px;
@@ -81,7 +81,7 @@
 .input, .textarea, .v6-select {
   width: 100%;
   border: 1px solid #BFBFBA;
-  border-radius: 0;
+  border-radius: 8px;
   background: #fff;
   color: #020202;
   outline: none;
@@ -170,17 +170,19 @@
   background: #fff;
   color: inherit;
   padding: 16px 18px;
-  transition: background .16s ease, border-color .16s ease, color .16s ease, box-shadow .16s ease;
+  border-radius: 10px;
+  transition: background .16s ease, border-color .16s ease, color .16s ease, box-shadow .16s ease, transform .14s ease;
 }
 .choice-option:hover {
   background: #F7F7F6;
-  border-color: #020202;
+  border-color: #BEBEB8;
+  transform: translateY(-1px);
+  box-shadow: 0 5px 18px rgba(0,0,0,.04);
 }
 .choice-option.selected {
-  background: #FFF7F7;
+  background: #FBF0F1;
   border-color: #C12029;
   color: #C12029;
-  box-shadow: inset 3px 0 0 #C12029;
   font-weight: 600;
 }
 .choice-option.dark {

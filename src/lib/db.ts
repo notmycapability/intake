@@ -12,6 +12,7 @@ import type {
   QuestionnaireStatus,
   ThemePreset,
   ShowCondition,
+  ResponseNote,
 } from './questions'
 import {
   buildSnapshot,
@@ -235,9 +236,11 @@ export async function updateQuestionnaire(id: string, input: {
   const slug = input.slug ?? existing.slug
   const purpose = input.purpose ?? existing.purpose
   const makeDefault = input.isDefault === true
-  const status = makeDefault ? 'live' : (input.status ?? existing.status)
+  const requestedStatus = input.status ?? existing.status
+  const status = makeDefault ? 'live' : requestedStatus
   const theme = { ...existing.theme, ...input.theme }
-  const isDefault = makeDefault ? true : input.isDefault === false ? false : existing.isDefault
+  let isDefault = makeDefault ? true : input.isDefault === false ? false : existing.isDefault
+  if (status === 'trash' || status === 'archived') isDefault = false
 
   if (makeDefault) {
     await db`UPDATE questionnaires SET is_default = false WHERE id <> ${id}`
@@ -257,7 +260,7 @@ export async function updateQuestionnaire(id: string, input: {
 export async function deleteQuestionnaire(id: string): Promise<boolean> {
   if (!isSafeId(id)) return false
   const db = getDb()
-  const result = await db`DELETE FROM questionnaires WHERE id = ${id} AND is_default = false`
+  await db`DELETE FROM questionnaires WHERE id = ${id}`
   return true
 }
 
@@ -444,7 +447,7 @@ function mapResponse(r: Record<string, unknown>, questions: QuestionData[] = [])
     name: responseTitle({ name, email, company, projectType }),
     company,
     email,
-    status: (r.status as 'new' | 'reviewed' | 'incomplete') || 'new',
+    status: (r.status as ResponseData['status']) || 'new',
     clarity: Number(r.clarity) || computeClarity(questions, stored),
     submittedAt: formatTs(r.created_at),
     createdAt: r.created_at ? new Date(String(r.created_at)).toISOString() : '',
@@ -453,6 +456,7 @@ function mapResponse(r: Record<string, unknown>, questions: QuestionData[] = [])
     ready: Array.isArray(r.ready) ? r.ready as string[] : [],
     clarify: Array.isArray(r.clarify) ? r.clarify as string[] : [],
     answers,
+    notes: parseNotes(r.notes),
   }
 }
 
@@ -509,11 +513,41 @@ export async function insertSubmission(input: {
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
-export async function updateResponseStatus(id: string, status: 'new' | 'reviewed'): Promise<boolean> {
+function parseNotes(raw: unknown): ResponseNote[] {
+  if (!Array.isArray(raw)) return []
+  return raw
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === 'object')
+    .map((item) => ({
+      id: String(item.id || ''),
+      author: String(item.author || 'Admin'),
+      time: String(item.time || ''),
+      body: String(item.body || ''),
+    }))
+    .filter((item) => item.id && item.body)
+}
+
+export async function updateResponseStatus(id: string, status: ResponseData['status']): Promise<boolean> {
   if (!UUID_RE.test(id)) return false
   const db = getDb()
   await db`UPDATE submissions SET status = ${status} WHERE id = ${id}`
   return true
+}
+
+export async function deleteResponse(id: string): Promise<boolean> {
+  if (!UUID_RE.test(id)) return false
+  const db = getDb()
+  await db`DELETE FROM submissions WHERE id = ${id}`
+  return true
+}
+
+export async function addResponseNote(id: string, note: ResponseNote): Promise<ResponseNote[] | null> {
+  if (!UUID_RE.test(id)) return null
+  const existing = await getResponse(id)
+  if (!existing) return null
+  const notes = [...existing.notes, note]
+  const db = getDb()
+  await db`UPDATE submissions SET notes = ${JSON.stringify(notes)}::jsonb WHERE id = ${id}`
+  return notes
 }
 
 // --- Seed ---
@@ -611,6 +645,7 @@ async function runMigrations(db: NeonQueryFunction<false, false>): Promise<void>
   await db`ALTER TABLE workspace ADD COLUMN IF NOT EXISTS notify_on_submit BOOLEAN NOT NULL DEFAULT true`
   await db`ALTER TABLE questions ADD COLUMN IF NOT EXISTS role TEXT`
   await db`ALTER TABLE submissions ADD COLUMN IF NOT EXISTS questionnaire_id TEXT NOT NULL DEFAULT ''`
+  await db`ALTER TABLE submissions ADD COLUMN IF NOT EXISTS notes JSONB NOT NULL DEFAULT '[]'`
 
 
   // Ensure indexes exist
